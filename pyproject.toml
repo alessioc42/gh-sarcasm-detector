@@ -1,0 +1,13 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --cov=sarcasm_detector --cov-report=term-missing --cov-fail-under=90"
+
+[tool.coverage.run]
+source = ["sarcasm_detector"]
+omit = ["sarcasm_detector/__init__.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+]

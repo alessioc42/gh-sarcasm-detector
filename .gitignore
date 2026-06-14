@@ -1,0 +1,11 @@
+raw_data
+*.db
+.env
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+data/
+.pytest_cache/
+.coverage
+htmlcov/
