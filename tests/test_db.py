@@ -263,6 +263,68 @@ class TestDatabase:
         with tmp_db.session() as conn:
             assert tmp_db.claim_next_job(conn) is None
 
+    def test_claim_next_job_for_model(self, tmp_db: Database) -> None:
+        with tmp_db.session() as conn:
+            series_id = tmp_db.get_or_create_series(conn, "Show")
+            clip_id = tmp_db.insert_clip(
+                conn,
+                series_id=series_id,
+                source_key="k",
+                source_archive="a.zip",
+                source_path="01",
+                episode=None,
+                time_start=None,
+                time_end=None,
+                ground_truth_sarcasm=True,
+            )
+            tmp_db.upsert_asset(
+                conn,
+                clip_id=clip_id,
+                asset_type="transcript_en",
+                mime_type=None,
+                content_text="text",
+                content_blob=None,
+                original_filename="en.txt",
+            )
+            model_a = tmp_db.upsert_model(conn, "model-a")
+            model_b = tmp_db.upsert_model(conn, "model-b")
+            tmp_db.ensure_jobs_for_clip(conn, clip_id, [model_a], {("text", "en")})
+            tmp_db.ensure_jobs_for_clip(conn, clip_id, [model_b], {("text", "en")})
+
+        with tmp_db.session() as conn:
+            job_a = tmp_db.claim_next_job_for_model(conn, model_a)
+        with tmp_db.session() as conn:
+            job_b = tmp_db.claim_next_job_for_model(conn, model_b)
+        assert job_a is not None
+        assert job_b is not None
+        assert job_a.model_name == "model-a"
+        assert job_b.model_name == "model-b"
+
+    def test_fail_pending_jobs_for_model(self, tmp_db: Database) -> None:
+        with tmp_db.session() as conn:
+            series_id = tmp_db.get_or_create_series(conn, "Show")
+            clip_id = tmp_db.insert_clip(
+                conn,
+                series_id=series_id,
+                source_key="k",
+                source_archive="a.zip",
+                source_path="01",
+                episode=None,
+                time_start=None,
+                time_end=None,
+                ground_truth_sarcasm=True,
+            )
+            model_id = tmp_db.upsert_model(conn, "m")
+            tmp_db.ensure_jobs_for_clip(conn, clip_id, [model_id], {("text", "en")})
+            failed = tmp_db.fail_pending_jobs_for_model(conn, model_id, "pull failed")
+            assert failed == 1
+
+    def test_count_pending_jobs_for_model(self, tmp_db: Database, seed_clip_with_job) -> None:
+        seed_clip_with_job(tmp_db)
+        with tmp_db.session() as conn:
+            model_id = tmp_db.upsert_model(conn, "test-model")
+            assert tmp_db.count_pending_jobs_for_model(conn, model_id) == 1
+
     def test_migrate_noop_when_current(self, tmp_db: Database) -> None:
         tmp_db.initialize()
         with tmp_db.session() as conn:

@@ -10,6 +10,8 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+PULL_TIMEOUT_SECONDS = 86400.0
+
 
 @dataclass
 class ChatResult:
@@ -26,15 +28,55 @@ class OllamaClient:
         headers: dict[str, str] = {}
         if api_token:
             headers["Authorization"] = f"Bearer {api_token}"
-        self._client = httpx.Client(base_url=self.endpoint, headers=headers, timeout=600.0)
+        self._headers = headers
+        self._client = httpx.Client(
+            base_url=self.endpoint, headers=headers, timeout=600.0
+        )
+        self._pull_client = httpx.Client(
+            base_url=self.endpoint, headers=headers, timeout=PULL_TIMEOUT_SECONDS
+        )
 
     def close(self) -> None:
         self._client.close()
+        self._pull_client.close()
 
     def show_model(self, model: str) -> dict[str, Any]:
         resp = self._client.post("/api/show", json={"model": model})
         resp.raise_for_status()
         return resp.json()
+
+    def model_is_available(self, model: str) -> bool:
+        try:
+            self.show_model(model)
+            return True
+        except httpx.HTTPError:
+            return False
+
+    def pull_model(self, model: str) -> None:
+        logger.info("Pulling model %s...", model)
+        resp = self._pull_client.post(
+            "/api/pull",
+            json={"model": model, "stream": False},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        status = data.get("status", "")
+        if status and status != "success":
+            raise RuntimeError(f"Pull failed for {model}: {data}")
+        logger.info("Model %s pulled successfully", model)
+
+    def delete_model(self, model: str) -> None:
+        logger.info("Deleting model %s from Ollama...", model)
+        resp = self._client.request(
+            "DELETE",
+            "/api/delete",
+            json={"model": model},
+        )
+        if resp.status_code == 404:
+            logger.warning("Model %s not found during delete (already removed?)", model)
+            return
+        resp.raise_for_status()
+        logger.info("Model %s deleted", model)
 
     def model_supports_audio(self, model: str) -> tuple[bool, list[str]]:
         try:

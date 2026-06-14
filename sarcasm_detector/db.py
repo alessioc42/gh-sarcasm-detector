@@ -291,18 +291,71 @@ class Database:
         return cur.rowcount
 
     def claim_next_job(self, conn: sqlite3.Connection) -> JobRecord | None:
-        conn.execute("BEGIN IMMEDIATE")
+        return self._claim_next_job(conn, model_id=None)
+
+    def claim_next_job_for_model(
+        self, conn: sqlite3.Connection, model_id: int
+    ) -> JobRecord | None:
+        return self._claim_next_job(conn, model_id=model_id)
+
+    def count_pending_jobs_for_model(
+        self, conn: sqlite3.Connection, model_id: int
+    ) -> int:
         row = conn.execute(
             """
-            SELECT j.id, j.clip_id, j.model_id, m.name AS model_name,
-                   j.modality, j.language, j.attempt_count
-            FROM jobs j
-            JOIN models m ON m.id = j.model_id
-            WHERE j.status = 'pending'
-            ORDER BY j.id
-            LIMIT 1
-            """
+            SELECT COUNT(*) AS cnt FROM jobs
+            WHERE model_id = ? AND status = 'pending'
+            """,
+            (model_id,),
         ).fetchone()
+        return int(row["cnt"]) if row else 0
+
+    def fail_pending_jobs_for_model(
+        self,
+        conn: sqlite3.Connection,
+        model_id: int,
+        reason: str,
+    ) -> int:
+        now = utc_now()
+        cur = conn.execute(
+            """
+            UPDATE jobs
+            SET status = 'failed', finished_at = ?, last_error = ?
+            WHERE model_id = ? AND status = 'pending'
+            """,
+            (now, reason, model_id),
+        )
+        return cur.rowcount
+
+    def _claim_next_job(
+        self, conn: sqlite3.Connection, *, model_id: int | None
+    ) -> JobRecord | None:
+        conn.execute("BEGIN IMMEDIATE")
+        if model_id is None:
+            row = conn.execute(
+                """
+                SELECT j.id, j.clip_id, j.model_id, m.name AS model_name,
+                       j.modality, j.language, j.attempt_count
+                FROM jobs j
+                JOIN models m ON m.id = j.model_id
+                WHERE j.status = 'pending'
+                ORDER BY j.id
+                LIMIT 1
+                """
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT j.id, j.clip_id, j.model_id, m.name AS model_name,
+                       j.modality, j.language, j.attempt_count
+                FROM jobs j
+                JOIN models m ON m.id = j.model_id
+                WHERE j.status = 'pending' AND j.model_id = ?
+                ORDER BY j.id
+                LIMIT 1
+                """,
+                (model_id,),
+            ).fetchone()
         if row is None:
             conn.execute("COMMIT")
             return None

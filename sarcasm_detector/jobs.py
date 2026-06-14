@@ -6,6 +6,7 @@ from .audio_util import encode_audio_base64
 from .config import Config
 from .db import Database, JobRecord
 from .import_raw import ensure_jobs_for_new_models, sync_models
+from .model_prefetch import ModelPrefetcher
 from .ollama_client import OllamaClient
 
 logger = logging.getLogger(__name__)
@@ -43,25 +44,22 @@ def _build_user_message(
 
 
 def _sync_model_capabilities(
-    db: Database, conn, client: OllamaClient, model_names: list[str]
+    db: Database, conn, client: OllamaClient, model_name: str, model_id: int
 ) -> None:
-    for name in model_names:
-        supports, caps = client.model_supports_audio(name)
-        model_id = db.upsert_model(
-            conn, name, supports_audio=supports, capabilities=caps
+    supports, caps = client.model_supports_audio(model_name)
+    db.upsert_model(conn, model_name, supports_audio=supports, capabilities=caps)
+    if not supports:
+        skipped = db.skip_audio_jobs_for_model(
+            conn,
+            model_id,
+            reason="Model does not report audio capability",
         )
-        if not supports:
-            skipped = db.skip_audio_jobs_for_model(
-                conn,
-                model_id,
-                reason="Model does not report audio capability",
+        if skipped:
+            logger.info(
+                "Skipped %d audio jobs for model %s (no audio support)",
+                skipped,
+                model_name,
             )
-            if skipped:
-                logger.info(
-                    "Skipped %d audio jobs for model %s (no audio support)",
-                    skipped,
-                    name,
-                )
 
 
 def _execute_job(
@@ -130,14 +128,37 @@ def _execute_job(
         )
 
 
+def _run_jobs_for_model(
+    db: Database,
+    client: OllamaClient,
+    model_id: int,
+    model_name: str,
+    system_prompt: str,
+) -> int:
+    processed = 0
+    while True:
+        with db.session() as conn:
+            job = db.claim_next_job_for_model(conn, model_id)
+            if job is None:
+                break
+            _execute_job(db, conn, client, job, system_prompt)
+            processed += 1
+    return processed
+
+
 def run_jobs(config: Config) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     db = Database(config.sqlite_db)
     db.initialize()
 
     model_names = config.load_models()
+    if not model_names:
+        logger.error("No models listed in %s", config.models_path)
+        return
+
     system_prompt = config.load_system_prompt()
     client = OllamaClient(config.ollama_endpoint, config.ollama_api_token)
+    prefetcher = ModelPrefetcher(client)
 
     try:
         with db.session() as conn:
@@ -146,19 +167,47 @@ def run_jobs(config: Config) -> None:
             reset = db.reset_running_jobs(conn)
             if reset:
                 logger.info("Reset %d stuck running jobs to pending", reset)
-            _sync_model_capabilities(db, conn, client, model_names)
 
-        processed = 0
-        while True:
+        total_processed = 0
+        for index, model_name in enumerate(model_names):
             with db.session() as conn:
-                job = db.claim_next_job(conn)
-                if job is None:
-                    break
-                _execute_job(db, conn, client, job, system_prompt)
-                processed += 1
+                model_id = db.upsert_model(conn, model_name)
 
-        logger.info("Run complete: processed %d jobs", processed)
+            if index + 1 < len(model_names):
+                prefetcher.schedule_pull(model_names[index + 1])
+
+            try:
+                prefetcher.ensure_pulled(model_name)
+            except Exception as exc:
+                logger.error("Failed to pull model %s: %s", model_name, exc)
+                with db.session() as conn:
+                    failed = db.fail_pending_jobs_for_model(
+                        conn, model_id, f"Model pull failed: {exc}"
+                    )
+                logger.info(
+                    "Marked %d pending jobs as failed for %s", failed, model_name
+                )
+                continue
+
+            with db.session() as conn:
+                pending = db.count_pending_jobs_for_model(conn, model_id)
+                _sync_model_capabilities(db, conn, client, model_name, model_id)
+
+            logger.info("Running %d pending jobs for %s", pending, model_name)
+            processed = _run_jobs_for_model(
+                db, client, model_id, model_name, system_prompt
+            )
+            total_processed += processed
+            logger.info("Finished %d jobs for %s", processed, model_name)
+
+            try:
+                client.delete_model(model_name)
+            except Exception as exc:
+                logger.warning("Failed to delete model %s: %s", model_name, exc)
+
+        logger.info("Run complete: processed %d jobs total", total_processed)
     finally:
+        prefetcher.cancel_all()
         client.close()
 
 

@@ -5,6 +5,7 @@ from unittest import mock
 
 import pytest
 
+from sarcasm_detector.config import Config
 from sarcasm_detector.db import Database
 from sarcasm_detector.jobs import (
     AUDIO_USER_PROMPT,
@@ -110,7 +111,7 @@ class TestSyncModelCapabilities:
         client.model_supports_audio.return_value = (False, ["completion"])
 
         with tmp_db.session() as conn:
-            _sync_model_capabilities(tmp_db, conn, client, ["text-only"])
+            _sync_model_capabilities(tmp_db, conn, client, "text-only", model_id)
             audio_status = conn.execute(
                 "SELECT status FROM jobs WHERE modality = 'audio'"
             ).fetchone()
@@ -234,10 +235,12 @@ class TestExecuteJob:
 
 
 class TestRunJobs:
+    @mock.patch("sarcasm_detector.jobs.ModelPrefetcher")
     @mock.patch("sarcasm_detector.jobs.OllamaClient")
     def test_run_jobs_processes_queue(
         self,
         mock_client_cls: mock.Mock,
+        mock_prefetch_cls: mock.Mock,
         config_with_db: Config,
         tmp_db: Database,
         seed_clip_with_job,
@@ -252,13 +255,71 @@ class TestRunJobs:
             duration_ms=1,
             request_payload={},
         )
+        prefetch = mock_prefetch_cls.return_value
         run_jobs(config)
+        prefetch.ensure_pulled.assert_called()
+        instance.delete_model.assert_called()
         instance.close.assert_called_once()
+        prefetch.cancel_all.assert_called_once()
 
+    @mock.patch("sarcasm_detector.jobs.ModelPrefetcher")
+    @mock.patch("sarcasm_detector.jobs.OllamaClient")
+    def test_run_jobs_prefetches_next_model(
+        self,
+        mock_client_cls: mock.Mock,
+        mock_prefetch_cls: mock.Mock,
+        config_with_db: Config,
+        tmp_db: Database,
+        seed_clip_with_job,
+    ) -> None:
+        config = config_with_db
+        config.models_path.write_text("model-a\nmodel-b\n")
+        seed_clip_with_job(tmp_db)
+        with tmp_db.session() as conn:
+            model_b = tmp_db.upsert_model(conn, "model-b")
+            tmp_db.ensure_jobs_for_clip(
+                conn,
+                conn.execute("SELECT id FROM clips").fetchone()["id"],
+                [model_b],
+                {("text", "en")},
+            )
+
+        mock_client_cls.return_value.model_supports_audio.return_value = (False, [])
+        mock_client_cls.return_value.chat.return_value = ChatResult(
+            raw_body="ok",
+            http_status=200,
+            duration_ms=1,
+            request_payload={},
+        )
+        prefetch = mock_prefetch_cls.return_value
+        run_jobs(config)
+        prefetch.schedule_pull.assert_called_with("model-b")
+
+    @mock.patch("sarcasm_detector.jobs.ModelPrefetcher")
+    @mock.patch("sarcasm_detector.jobs.OllamaClient")
+    def test_run_jobs_pull_failure_marks_jobs_failed(
+        self,
+        mock_client_cls: mock.Mock,
+        mock_prefetch_cls: mock.Mock,
+        config_with_db: Config,
+        tmp_db: Database,
+        seed_clip_with_job,
+    ) -> None:
+        config = config_with_db
+        seed_clip_with_job(tmp_db)
+        prefetch = mock_prefetch_cls.return_value
+        prefetch.ensure_pulled.side_effect = RuntimeError("pull failed")
+        run_jobs(config)
+        with tmp_db.session() as conn:
+            status = conn.execute("SELECT status FROM jobs").fetchone()
+        assert status["status"] == "failed"
+
+    @mock.patch("sarcasm_detector.jobs.ModelPrefetcher")
     @mock.patch("sarcasm_detector.jobs.OllamaClient")
     def test_run_jobs_resets_stuck(
         self,
         mock_client_cls: mock.Mock,
+        mock_prefetch_cls: mock.Mock,
         config_with_db: Config,
         tmp_db: Database,
         seed_clip_with_job,
@@ -281,6 +342,12 @@ class TestRunJobs:
         with tmp_db.session() as conn:
             status = conn.execute("SELECT status FROM jobs").fetchone()
         assert status["status"] == "completed"
+
+    @mock.patch("sarcasm_detector.jobs.OllamaClient")
+    def test_run_jobs_no_models(self, mock_client_cls: mock.Mock, config: Config) -> None:
+        config.models_path.write_text("# empty\n")
+        run_jobs(config)
+        mock_client_cls.assert_not_called()
 
 
 class TestRunStatus:

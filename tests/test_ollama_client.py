@@ -27,10 +27,9 @@ class TestRedactPayload:
 class TestOllamaClient:
     def _client_with_handler(self, handler):
         client = OllamaClient("http://test")
-        client._client = httpx.Client(
-            transport=httpx.MockTransport(handler),
-            base_url="http://test",
-        )
+        transport = httpx.MockTransport(handler)
+        client._client = httpx.Client(transport=transport, base_url="http://test")
+        client._pull_client = httpx.Client(transport=transport, base_url="http://test")
         return client
 
     def test_show_model(self) -> None:
@@ -131,4 +130,52 @@ class TestOllamaClient:
         )
         client.model_supports_audio("m")
         assert captured["auth"] == "Bearer tok123"
+        client.close()
+
+    def test_pull_model(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/api/pull"
+            body = json.loads(request.content)
+            assert body["stream"] is False
+            return httpx.Response(200, json={"status": "success"})
+
+        client = self._client_with_handler(handler)
+        client.pull_model("llama3.2")
+        client.close()
+
+    def test_pull_model_failure_status(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"status": "error", "error": "nope"})
+
+        client = self._client_with_handler(handler)
+        with pytest.raises(RuntimeError, match="Pull failed"):
+            client.pull_model("bad")
+        client.close()
+
+    def test_delete_model(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.method == "DELETE"
+            assert request.url.path == "/api/delete"
+            return httpx.Response(200)
+
+        client = self._client_with_handler(handler)
+        client.delete_model("llama3.2")
+        client.close()
+
+    def test_delete_model_not_found(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404)
+
+        client = self._client_with_handler(handler)
+        client.delete_model("missing")
+        client.close()
+
+    def test_model_is_available(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/show":
+                return httpx.Response(200, json={"capabilities": []})
+            return httpx.Response(404)
+
+        client = self._client_with_handler(handler)
+        assert client.model_is_available("m") is True
         client.close()
