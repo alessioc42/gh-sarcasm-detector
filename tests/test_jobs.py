@@ -448,3 +448,22 @@ class TestRunStatus:
         assert "Clips: 1" in out
         assert "Jobs to run: 1" in out
         assert "pending: 1" in out
+
+    def test_run_status_with_verdicts(
+        self, config_with_db: Config, tmp_db: Database, seed_clip_with_job, capsys
+    ) -> None:
+        seed_clip_with_job(tmp_db)
+        with tmp_db.session() as conn:
+            job_id = conn.execute("SELECT id FROM jobs").fetchone()["id"]
+            tmp_db.upsert_job_verdict(
+                conn,
+                job_id=job_id,
+                verdict="SARCASTIC",
+                sarcastic=True,
+                confidence=8,
+                parse_error=None,
+            )
+        run_status(config_with_db)
+        out = capsys.readouterr().out
+        assert "Verdicts:" in out
+        assert "SARCASTIC: 1" in out

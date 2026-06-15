@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Generator, Iterable
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -82,6 +82,19 @@ CREATE TABLE IF NOT EXISTS job_outputs (
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_clips_source_key ON clips(source_key);
+
+CREATE TABLE IF NOT EXISTS job_verdicts (
+    job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+    verdict TEXT NOT NULL CHECK (verdict IN (
+        'SARCASTIC', 'NOT_SARCASTIC', 'LLM_ERR', 'EXEC_ERR'
+    )),
+    sarcastic INTEGER,
+    confidence INTEGER,
+    parse_error TEXT,
+    parsed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_verdicts_verdict ON job_verdicts(verdict);
 """
 
 
@@ -98,6 +111,13 @@ class JobRecord:
     modality: str
     language: str
     attempt_count: int
+
+
+@dataclass
+class JobForParsing:
+    id: int
+    status: str
+    last_error: str | None
 
 
 class Database:
@@ -139,16 +159,38 @@ class Database:
         if version >= SCHEMA_VERSION:
             return
 
-        columns = {
-            row[1] for row in conn.execute("PRAGMA table_info(clip_assets)").fetchall()
-        }
-        if "blob_encoding" not in columns:
-            conn.execute(
+        if version < 2:
+            columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(clip_assets)").fetchall()
+            }
+            if "blob_encoding" not in columns:
+                conn.execute(
+                    """
+                    ALTER TABLE clip_assets
+                    ADD COLUMN blob_encoding TEXT NOT NULL DEFAULT 'raw'
+                    """
+                )
+            version = 2
+
+        if version < 3:
+            conn.executescript(
                 """
-                ALTER TABLE clip_assets
-                ADD COLUMN blob_encoding TEXT NOT NULL DEFAULT 'raw'
+                CREATE TABLE IF NOT EXISTS job_verdicts (
+                    job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+                    verdict TEXT NOT NULL CHECK (verdict IN (
+                        'SARCASTIC', 'NOT_SARCASTIC', 'LLM_ERR', 'EXEC_ERR'
+                    )),
+                    sarcastic INTEGER,
+                    confidence INTEGER,
+                    parse_error TEXT,
+                    parsed_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_job_verdicts_verdict
+                    ON job_verdicts(verdict);
                 """
             )
+            version = 3
 
         conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
 
@@ -472,3 +514,61 @@ class Database:
     def count_clips(self, conn: sqlite3.Connection) -> int:
         row = conn.execute("SELECT COUNT(*) AS cnt FROM clips").fetchone()
         return int(row["cnt"]) if row else 0
+
+    def get_latest_job_output(
+        self, conn: sqlite3.Connection, job_id: int
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            """
+            SELECT * FROM job_outputs
+            WHERE job_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone()
+
+    def upsert_job_verdict(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        job_id: int,
+        verdict: str,
+        sarcastic: bool | None,
+        confidence: int | None,
+        parse_error: str | None,
+    ) -> None:
+        sarcastic_val = None if sarcastic is None else int(sarcastic)
+        conn.execute(
+            """
+            INSERT INTO job_verdicts (
+                job_id, verdict, sarcastic, confidence, parse_error, parsed_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                verdict = excluded.verdict,
+                sarcastic = excluded.sarcastic,
+                confidence = excluded.confidence,
+                parse_error = excluded.parse_error,
+                parsed_at = excluded.parsed_at
+            """,
+            (job_id, verdict, sarcastic_val, confidence, parse_error, utc_now()),
+        )
+
+    def verdict_counts(self, conn: sqlite3.Connection) -> dict[str, int]:
+        rows = conn.execute(
+            "SELECT verdict, COUNT(*) AS cnt FROM job_verdicts GROUP BY verdict"
+        ).fetchall()
+        return {str(r["verdict"]): int(r["cnt"]) for r in rows}
+
+    def list_jobs_for_parsing(self, conn: sqlite3.Connection) -> list[JobForParsing]:
+        rows = conn.execute(
+            "SELECT id, status, last_error FROM jobs ORDER BY id"
+        ).fetchall()
+        return [
+            JobForParsing(
+                id=int(r["id"]),
+                status=str(r["status"]),
+                last_error=str(r["last_error"]) if r["last_error"] else None,
+            )
+            for r in rows
+        ]

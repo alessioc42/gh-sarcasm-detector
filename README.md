@@ -84,6 +84,42 @@ sqlite3 sarcasm.db "SELECT status, COUNT(*) FROM jobs GROUP BY status;"
 sqlite3 sarcasm.db "SELECT raw_response_body FROM job_outputs LIMIT 1;"
 ```
 
+### 5. Parse results
+
+After evaluation completes, extract structured verdicts from LLM responses:
+
+```bash
+python -m sarcasm_detector parse
+python -m sarcasm_detector status
+```
+
+Each job gets one of four verdicts stored in `job_verdicts`:
+
+| Verdict | Meaning |
+|---------|---------|
+| `SARCASTIC` | Parsed JSON with `"sarcastic": true` |
+| `NOT_SARCASTIC` | Parsed JSON with `"sarcastic": false` |
+| `LLM_ERR` | Completed job but response had no valid schema JSON |
+| `EXEC_ERR` | Job failed or was skipped during execution |
+
+`confidence` is stored as an integer 0–10 when the LLM returned one; otherwise `NULL`.
+
+```bash
+sqlite3 sarcasm.db "SELECT verdict, COUNT(*) FROM job_verdicts GROUP BY verdict;"
+```
+
+### 6. Analysis notebook
+
+Visualize parsed results with descriptive charts (no performance interpretation in the notebook text):
+
+```bash
+pip install -r requirements-notebook.txt
+python -m sarcasm_detector parse   # if not already done
+jupyter notebook notebooks/eval_analysis.ipynb
+```
+
+Set `SQLITE_DB` if your database is not `./sarcasm.db`.
+
 ## Configuration
 
 | Variable | Default | Description |

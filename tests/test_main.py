@@ -42,3 +42,8 @@ class TestMain:
     def test_status_command(self, mock_run: mock.Mock) -> None:
         assert main(["status"]) == 0
         mock_run.assert_called_once()
+
+    @mock.patch("sarcasm_detector.__main__.run_parse")
+    def test_parse_command(self, mock_run: mock.Mock) -> None:
+        assert main(["parse"]) == 0
+        mock_run.assert_called_once()

@@ -360,6 +360,7 @@ def run_status(config: Config) -> None:
         clips = db.count_clips(conn)
         counts = db.job_status_counts(conn)
         pending = counts.get("pending", 0)
+        verdict_counts = db.verdict_counts(conn)
 
     print(f"Database: {config.sqlite_db}")
     print(f"Models: {len(model_names)} (from {config.models_path})")
@@ -376,3 +377,7 @@ def run_status(config: Config) -> None:
             print(f"  {status}: {counts[status]}")
     else:
         print("Jobs: none")
+    if verdict_counts:
+        print("Verdicts:")
+        for verdict in sorted(verdict_counts):
+            print(f"  {verdict}: {verdict_counts[verdict]}")

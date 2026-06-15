@@ -93,6 +93,43 @@ class TestDatabase:
             assert "blob_encoding" in cols
             assert int(conn.execute("SELECT version FROM schema_version").fetchone()[0]) == SCHEMA_VERSION
 
+    def test_migration_adds_job_verdicts(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "v2.db"
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version VALUES (2);
+            CREATE TABLE jobs (
+                id INTEGER PRIMARY KEY,
+                clip_id INTEGER,
+                model_id INTEGER,
+                modality TEXT,
+                language TEXT,
+                status TEXT DEFAULT 'pending',
+                attempt_count INTEGER DEFAULT 0,
+                last_error TEXT,
+                created_at TEXT DEFAULT (datetime('now')),
+                started_at TEXT,
+                finished_at TEXT
+            );
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        db = Database(db_path)
+        db.initialize()
+        with db.session() as conn:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            assert "job_verdicts" in tables
+            assert int(conn.execute("SELECT version FROM schema_version").fetchone()[0]) == SCHEMA_VERSION
+
     def test_get_or_create_series(self, tmp_db: Database) -> None:
         with tmp_db.session() as conn:
             a = tmp_db.get_or_create_series(conn, "Show")
@@ -330,6 +367,67 @@ class TestDatabase:
         with tmp_db.session() as conn:
             version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
         assert version == SCHEMA_VERSION
+
+    def test_upsert_job_verdict(self, tmp_db: Database, seed_clip_with_job) -> None:
+        seed_clip_with_job(tmp_db)
+        with tmp_db.session() as conn:
+            job_id = conn.execute("SELECT id FROM jobs").fetchone()["id"]
+            tmp_db.upsert_job_verdict(
+                conn,
+                job_id=job_id,
+                verdict="SARCASTIC",
+                sarcastic=True,
+                confidence=7,
+                parse_error=None,
+            )
+            tmp_db.upsert_job_verdict(
+                conn,
+                job_id=job_id,
+                verdict="NOT_SARCASTIC",
+                sarcastic=False,
+                confidence=None,
+                parse_error=None,
+            )
+            row = conn.execute(
+                "SELECT verdict, sarcastic, confidence FROM job_verdicts WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            counts = tmp_db.verdict_counts(conn)
+        assert row["verdict"] == "NOT_SARCASTIC"
+        assert row["sarcastic"] == 0
+        assert row["confidence"] is None
+        assert counts["NOT_SARCASTIC"] == 1
+
+    def test_get_latest_job_output(self, tmp_db: Database, seed_clip_with_job) -> None:
+        seed_clip_with_job(tmp_db)
+        with tmp_db.session() as conn:
+            job_id = conn.execute("SELECT id FROM jobs").fetchone()["id"]
+            tmp_db.insert_job_output(
+                conn,
+                job_id=job_id,
+                raw_response_body="first",
+                request_payload={},
+                http_status=200,
+                duration_ms=1,
+            )
+            tmp_db.insert_job_output(
+                conn,
+                job_id=job_id,
+                raw_response_body="second",
+                request_payload={},
+                http_status=200,
+                duration_ms=2,
+            )
+            output = tmp_db.get_latest_job_output(conn, job_id)
+        assert output is not None
+        assert output["raw_response_body"] == "second"
+
+    def test_list_jobs_for_parsing(self, tmp_db: Database, seed_clip_with_job) -> None:
+        seed_clip_with_job(tmp_db)
+        with tmp_db.session() as conn:
+            jobs = tmp_db.list_jobs_for_parsing(conn)
+        assert len(jobs) == 1
+        assert jobs[0].status == "pending"
 
     def test_session_rollback_on_error(self, tmp_path: Path) -> None:
         db = Database(tmp_path / "rollback.db")
