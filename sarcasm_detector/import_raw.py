@@ -11,6 +11,7 @@ from pathlib import Path
 from .audio_util import mime_for_filename
 from .config import Config
 from .db import Database
+from .logging_config import configure_logging
 
 logger = logging.getLogger(__name__)
 
@@ -293,6 +294,17 @@ def sync_models(db: Database, conn, model_names: list[str]) -> list[int]:
     return ids
 
 
+def sync_models_from_config(
+    db: Database, conn, config: Config
+) -> tuple[list[str], list[int], int]:
+    model_names = config.load_models()
+    if not model_names:
+        return model_names, [], 0
+    model_ids = sync_models(db, conn, model_names)
+    created = ensure_jobs_for_new_models(db, conn, model_ids)
+    return model_names, model_ids, created
+
+
 def ensure_jobs_for_new_models(db: Database, conn, model_ids: list[int]) -> int:
     created = 0
     rows = conn.execute("SELECT id FROM clips").fetchall()
@@ -312,8 +324,29 @@ def ensure_jobs_for_new_models(db: Database, conn, model_ids: list[int]) -> int:
     return created
 
 
+def run_sync_models(config: Config) -> None:
+    configure_logging()
+    db = Database(config.sqlite_db)
+    db.initialize()
+
+    with db.session() as conn:
+        model_names, _, created = sync_models_from_config(db, conn, config)
+
+    if not model_names:
+        logger.error("No models listed in %s", config.models_path)
+        return
+
+    logger.info(
+        "Synced %d models from %s, created %d new jobs (db: %s)",
+        len(model_names),
+        config.models_path,
+        created,
+        config.sqlite_db,
+    )
+
+
 def run_import(config: Config) -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    configure_logging()
     db = Database(config.sqlite_db)
     db.initialize()
 
@@ -330,8 +363,7 @@ def run_import(config: Config) -> None:
     total_jobs = 0
 
     with db.session() as conn:
-        model_ids = sync_models(db, conn, model_names)
-        new_model_jobs = ensure_jobs_for_new_models(db, conn, model_ids)
+        _, model_ids, new_model_jobs = sync_models_from_config(db, conn, config)
         total_jobs += new_model_jobs
 
         for archive in archives:

@@ -13,5 +13,5 @@ export PYTHONUNBUFFERED=1
 
 # python -m sarcasm_detector import
 # python -m sarcasm_detector compress
-python -m sarcasm_detector run
-# python -m sarcasm_detector status
+# python -m sarcasm_detector run
+python -m sarcasm_detector status

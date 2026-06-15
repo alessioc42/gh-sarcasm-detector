@@ -6,11 +6,18 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-import httpx
+from ollama import Client as OllamaSdkClient
+from ollama import ResponseError
 
 logger = logging.getLogger(__name__)
 
+CHAT_TIMEOUT_SECONDS = 600.0
 PULL_TIMEOUT_SECONDS = 86400.0
+
+# Expected reply JSON only, e.g. {"sarcastic": false, "confidence": 10}
+# (~37 chars, ~15 tokens once tokenized). 20x headroom for fences or brief preamble.
+_ESTIMATED_RESPONSE_JSON_TOKENS = 15
+MAX_GENERATED_TOKENS = _ESTIMATED_RESPONSE_JSON_TOKENS * 40
 
 
 @dataclass
@@ -24,16 +31,18 @@ class ChatResult:
 
 class OllamaClient:
     def __init__(self, endpoint: str, api_token: str | None = None) -> None:
-        self.endpoint = endpoint.rstrip("/")
         headers: dict[str, str] = {}
         if api_token:
             headers["Authorization"] = f"Bearer {api_token}"
-        self._headers = headers
-        self._client = httpx.Client(
-            base_url=self.endpoint, headers=headers, timeout=600.0
+        self._client = OllamaSdkClient(
+            host=endpoint.rstrip("/"),
+            headers=headers or None,
+            timeout=CHAT_TIMEOUT_SECONDS,
         )
-        self._pull_client = httpx.Client(
-            base_url=self.endpoint, headers=headers, timeout=PULL_TIMEOUT_SECONDS
+        self._pull_client = OllamaSdkClient(
+            host=endpoint.rstrip("/"),
+            headers=headers or None,
+            timeout=PULL_TIMEOUT_SECONDS,
         )
 
     def close(self) -> None:
@@ -41,47 +50,43 @@ class OllamaClient:
         self._pull_client.close()
 
     def show_model(self, model: str) -> dict[str, Any]:
-        resp = self._client.post("/api/show", json={"model": model})
-        resp.raise_for_status()
-        return resp.json()
+        return self._client.show(model).model_dump()
 
     def model_is_available(self, model: str) -> bool:
         try:
-            self.show_model(model)
+            self._client.show(model)
             return True
-        except httpx.HTTPError:
+        except (ResponseError, ConnectionError):
             return False
 
     def pull_model(self, model: str) -> None:
         logger.info("Pulling model %s...", model)
-        resp = self._pull_client.post(
-            "/api/pull",
-            json={"model": model, "stream": False},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        status = data.get("status", "")
-        if status and status != "success":
-            raise RuntimeError(f"Pull failed for {model}: {data}")
+        last_status: str | None = None
+        for progress in self._pull_client.pull(model, stream=True):
+            status = progress.status
+            if status and status != last_status:
+                logger.info("Pull %s: %s", model, status)
+                last_status = status
         logger.info("Model %s pulled successfully", model)
 
     def delete_model(self, model: str) -> None:
         logger.info("Deleting model %s from Ollama...", model)
-        resp = self._client.request(
-            "DELETE",
-            "/api/delete",
-            json={"model": model},
-        )
-        if resp.status_code == 404:
-            logger.warning("Model %s not found during delete (already removed?)", model)
-            return
-        resp.raise_for_status()
-        logger.info("Model %s deleted", model)
+        try:
+            self._client.delete(model)
+            logger.info("Model %s deleted", model)
+        except ResponseError as exc:
+            if exc.status_code == 404:
+                logger.warning(
+                    "Model %s not found during delete (already removed?)",
+                    model,
+                )
+                return
+            raise
 
     def model_supports_audio(self, model: str) -> tuple[bool, list[str]]:
         try:
             data = self.show_model(model)
-        except httpx.HTTPError as exc:
+        except ResponseError as exc:
             logger.warning("Could not fetch capabilities for %s: %s", model, exc)
             return False, []
 
@@ -100,39 +105,48 @@ class OllamaClient:
         user_message: str,
         audio_b64: str | None = None,
     ) -> ChatResult:
-        message: dict[str, Any] = {"role": "user", "content": user_message}
+        user_msg: dict[str, Any] = {"role": "user", "content": user_message}
         if audio_b64:
-            message["images"] = [audio_b64]
+            user_msg["images"] = [audio_b64]
 
+        messages = [
+            {"role": "system", "content": system_prompt},
+            user_msg,
+        ]
         payload: dict[str, Any] = {
             "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                message,
-            ],
+            "messages": messages,
             "stream": False,
+            "options": {"num_predict": MAX_GENERATED_TOKENS},
         }
 
         start = time.monotonic()
         try:
-            resp = self._client.post("/api/chat", json=payload)
+            response = self._client.chat(
+                model=model,
+                messages=messages,
+                stream=False,
+                options={"num_predict": MAX_GENERATED_TOKENS},
+            )
             duration_ms = int((time.monotonic() - start) * 1000)
-            raw = resp.text
-            if resp.is_success:
-                return ChatResult(
-                    raw_body=raw,
-                    http_status=resp.status_code,
-                    duration_ms=duration_ms,
-                    request_payload=_redact_payload(payload),
-                )
+            raw = json.dumps(response.model_dump())
             return ChatResult(
                 raw_body=raw,
-                http_status=resp.status_code,
+                http_status=200,
                 duration_ms=duration_ms,
                 request_payload=_redact_payload(payload),
-                error_message=f"HTTP {resp.status_code}: {raw[:500]}",
             )
-        except httpx.HTTPError as exc:
+        except ResponseError as exc:
+            duration_ms = int((time.monotonic() - start) * 1000)
+            error_text = str(exc.error or exc)
+            return ChatResult(
+                raw_body=error_text,
+                http_status=exc.status_code,
+                duration_ms=duration_ms,
+                request_payload=_redact_payload(payload),
+                error_message=f"HTTP {exc.status_code}: {error_text[:500]}",
+            )
+        except ConnectionError as exc:
             duration_ms = int((time.monotonic() - start) * 1000)
             return ChatResult(
                 raw_body="",

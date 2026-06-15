@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from unittest import mock
 
 import pytest
@@ -44,4 +46,30 @@ class TestModelPrefetcher:
         prefetcher = ModelPrefetcher(client)
         with pytest.raises(RuntimeError, match="network down"):
             prefetcher.ensure_pulled("model-a")
+        prefetcher.cancel_all()
+
+    def test_prefetch_next_before_current_blocks_on_wrong_model(self) -> None:
+        pull_order: list[str] = []
+        pull_started = threading.Event()
+        release_pull = threading.Event()
+
+        def pull_model(model_name: str) -> None:
+            pull_order.append(model_name)
+            pull_started.set()
+            release_pull.wait(timeout=2)
+
+        client = mock.Mock(spec=OllamaClient)
+        client.model_is_available.return_value = False
+        client.pull_model.side_effect = pull_model
+        prefetcher = ModelPrefetcher(client)
+
+        prefetcher.schedule_pull("model-b")
+        waiter = threading.Thread(target=prefetcher.ensure_pulled, args=("model-a",))
+        waiter.start()
+        assert pull_started.wait(timeout=2)
+        assert pull_order == ["model-b"]
+
+        release_pull.set()
+        waiter.join(timeout=2)
+        assert pull_order == ["model-b", "model-a"]
         prefetcher.cancel_all()

@@ -30,12 +30,16 @@ class ModelPrefetcher:
     def ensure_pulled(self, model_name: str) -> None:
         with self._lock:
             if model_name not in self._futures:
+                logger.info("Starting on-demand pull for %s", model_name)
                 self._futures[model_name] = self._executor.submit(
                     self._pull_and_store, model_name
                 )
+            else:
+                logger.info("Waiting for scheduled pull of %s to finish", model_name)
             future = self._futures[model_name]
 
         future.result()
+        logger.info("Model %s is ready for evaluation", model_name)
 
     def cancel_all(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
@@ -44,4 +48,6 @@ class ModelPrefetcher:
         if self._client.model_is_available(model_name):
             logger.info("Model %s already available locally", model_name)
             return
+        logger.info("Downloading model %s from Ollama", model_name)
         self._client.pull_model(model_name)
+        logger.info("Download complete for %s", model_name)

@@ -22,6 +22,7 @@ from sarcasm_detector.import_raw import (
     parse_misc_txt,
     read_series_name,
     run_import,
+    run_sync_models,
     sync_models,
 )
 
@@ -173,13 +174,15 @@ class TestImportArchive:
         assert imported == 1
         assert jobs == 2
 
-    def test_run_import_no_archives(self, config: Config, caplog: pytest.LogCaptureFixture) -> None:
+    def test_run_import_no_archives(
+        self, config: Config, capsys: pytest.CaptureFixture[str]
+    ) -> None:
         config.raw_data_dir.mkdir()
         run_import(config)
-        assert "No archives found" in caplog.text
+        assert "No archives found" in capsys.readouterr().err
 
     def test_run_import_no_models_warning(
-        self, config: Config, sample_zip: Path, caplog: pytest.LogCaptureFixture
+        self, config: Config, sample_zip: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         config.raw_data_dir.mkdir()
         config.models_path.write_text("# only comments\n")
@@ -187,7 +190,7 @@ class TestImportArchive:
 
         shutil.copy(sample_zip, config.raw_data_dir / sample_zip.name)
         run_import(config)
-        assert "No models listed" in caplog.text
+        assert "No models listed" in capsys.readouterr().err
 
     def test_collect_skips_unrecognized_and_aup3(self, tmp_path: Path) -> None:
         clip = tmp_path / "01"
@@ -219,3 +222,15 @@ class TestImportArchive:
             created = ensure_jobs_for_new_models(tmp_db, conn, [model_b])
             assert created == 4
             assert sync_models(tmp_db, conn, ["model-a", "model-b"]) == [model_a, model_b]
+
+    def test_run_sync_models(self, config: Config, sample_zip: Path) -> None:
+        import shutil
+
+        config.raw_data_dir.mkdir()
+        shutil.copy(sample_zip, config.raw_data_dir / sample_zip.name)
+        run_import(config)
+        (config.models_path).write_text("test-model\nnew-model\n")
+        run_sync_models(config)
+        db = Database(config.sqlite_db)
+        with db.session() as conn:
+            assert db.job_status_counts(conn)["pending"] == 8

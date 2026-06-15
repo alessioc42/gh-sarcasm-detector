@@ -10,6 +10,7 @@ from .audio_util import (
 )
 from .config import Config
 from .db import Database
+from .logging_config import configure_logging
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +21,7 @@ def _flac_filename(filename: str) -> str:
 
 def run_compress(config: Config) -> None:
     """Re-encode stored audio as 16 kHz mono FLAC (canonical for LLM encoders)."""
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    configure_logging()
     db = Database(config.sqlite_db)
     db.initialize()
 

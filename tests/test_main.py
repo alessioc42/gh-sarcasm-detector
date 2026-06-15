@@ -28,6 +28,11 @@ class TestMain:
         assert main(["compress"]) == 0
         mock_run.assert_called_once()
 
+    @mock.patch("sarcasm_detector.__main__.run_sync_models")
+    def test_sync_models_command(self, mock_run: mock.Mock) -> None:
+        assert main(["sync-models"]) == 0
+        mock_run.assert_called_once()
+
     @mock.patch("sarcasm_detector.__main__.run_jobs")
     def test_run_command(self, mock_run: mock.Mock) -> None:
         assert main(["run"]) == 0

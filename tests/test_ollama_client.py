@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest import mock
 
-import httpx
 import pytest
+from ollama import ResponseError
 
-from sarcasm_detector.ollama_client import ChatResult, OllamaClient, _redact_payload
+from sarcasm_detector.ollama_client import (
+    ChatResult,
+    MAX_GENERATED_TOKENS,
+    OllamaClient,
+    _redact_payload,
+)
 
 
 class TestRedactPayload:
@@ -24,65 +30,64 @@ class TestRedactPayload:
         assert _redact_payload(payload) == payload
 
 
+class TestMaxGeneratedTokens:
+    def test_limit_is_eight_times_json_estimate(self) -> None:
+        assert MAX_GENERATED_TOKENS == 15 * 8
+
+
 class TestOllamaClient:
-    def _client_with_handler(self, handler):
+    def _client_with_mock(self) -> tuple[OllamaClient, mock.Mock, mock.Mock]:
         client = OllamaClient("http://test")
-        transport = httpx.MockTransport(handler)
-        client._client = httpx.Client(transport=transport, base_url="http://test")
-        client._pull_client = httpx.Client(transport=transport, base_url="http://test")
-        return client
+        sdk = mock.Mock()
+        pull_sdk = mock.Mock()
+        client._client = sdk
+        client._pull_client = pull_sdk
+        return client, sdk, pull_sdk
 
     def test_show_model(self) -> None:
-        def handler(request: httpx.Request) -> httpx.Response:
-            assert request.url.path == "/api/show"
-            return httpx.Response(200, json={"capabilities": ["audio", "completion"]})
-
-        client = self._client_with_handler(handler)
+        client, sdk, _ = self._client_with_mock()
+        sdk.show.return_value = SimpleNamespace(
+            model_dump=lambda: {"capabilities": ["audio", "completion"]}
+        )
         data = client.show_model("test-model")
         assert "audio" in data["capabilities"]
         client.close()
 
     def test_model_supports_audio_true(self) -> None:
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json={"capabilities": ["audio"]})
-
-        client = self._client_with_handler(handler)
+        client, sdk, _ = self._client_with_mock()
+        sdk.show.return_value = SimpleNamespace(
+            model_dump=lambda: {"capabilities": ["audio"]}
+        )
         supports, caps = client.model_supports_audio("m")
         assert supports is True
         assert caps == ["audio"]
         client.close()
 
     def test_model_supports_audio_http_error(self) -> None:
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(500, text="error")
-
-        client = self._client_with_handler(handler)
+        client, sdk, _ = self._client_with_mock()
+        sdk.show.side_effect = ResponseError("error", 500)
         supports, caps = client.model_supports_audio("m")
         assert supports is False
         assert caps == []
         client.close()
 
     def test_model_supports_audio_invalid_capabilities(self) -> None:
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json={"capabilities": "nope"})
-
-        client = self._client_with_handler(handler)
+        client, sdk, _ = self._client_with_mock()
+        sdk.show.return_value = SimpleNamespace(
+            model_dump=lambda: {"capabilities": "nope"}
+        )
         supports, caps = client.model_supports_audio("m")
         assert supports is False
         assert caps == []
         client.close()
 
     def test_chat_success(self) -> None:
-        def handler(request: httpx.Request) -> httpx.Response:
-            body = json.loads(request.content)
-            assert body["stream"] is False
-            assert body["messages"][0]["role"] == "system"
-            return httpx.Response(
-                200,
-                json={"message": {"content": '{"sarcastic": true, "confidence": 0.9}'}},
-            )
-
-        client = self._client_with_handler(handler)
+        client, sdk, _ = self._client_with_mock()
+        sdk.chat.return_value = SimpleNamespace(
+            model_dump=lambda: {
+                "message": {"content": '{"sarcastic": true, "confidence": 0.9}'}
+            }
+        )
         result = client.chat(
             model="m",
             system_prompt="sys",
@@ -93,89 +98,67 @@ class TestOllamaClient:
         assert result.error_message is None
         assert result.http_status == 200
         assert "sarcastic" in result.raw_body
+        sdk.chat.assert_called_once()
+        messages = sdk.chat.call_args.kwargs["messages"]
+        assert messages[0]["role"] == "system"
+        assert messages[1]["images"] == ["abc"]
+        assert sdk.chat.call_args.kwargs["options"] == {
+            "num_predict": MAX_GENERATED_TOKENS
+        }
         client.close()
 
     def test_chat_http_error(self) -> None:
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(400, text="bad request")
-
-        client = self._client_with_handler(handler)
+        client, sdk, _ = self._client_with_mock()
+        sdk.chat.side_effect = ResponseError("bad request", 400)
         result = client.chat(model="m", system_prompt="s", user_message="u")
         assert result.error_message is not None
         assert result.http_status == 400
         client.close()
 
     def test_chat_transport_error(self) -> None:
-        def handler(request: httpx.Request) -> httpx.Response:
-            raise httpx.ConnectError("down")
-
-        client = self._client_with_handler(handler)
+        client, sdk, _ = self._client_with_mock()
+        sdk.chat.side_effect = ConnectionError("down")
         result = client.chat(model="m", system_prompt="s", user_message="u")
         assert result.http_status == 0
         assert "down" in result.error_message
         client.close()
 
     def test_auth_header(self) -> None:
-        captured = {}
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            captured["auth"] = request.headers.get("Authorization")
-            return httpx.Response(200, json={"capabilities": []})
-
-        client = OllamaClient("http://test", api_token="tok123")
-        client._client = httpx.Client(
-            transport=httpx.MockTransport(handler),
-            base_url="http://test",
-            headers={"Authorization": "Bearer tok123"},
-        )
-        client.model_supports_audio("m")
-        assert captured["auth"] == "Bearer tok123"
-        client.close()
+        with mock.patch("sarcasm_detector.ollama_client.OllamaSdkClient") as mock_cls:
+            OllamaClient("http://test", api_token="tok123")
+            kwargs = mock_cls.call_args.kwargs
+            assert kwargs["headers"]["Authorization"] == "Bearer tok123"
 
     def test_pull_model(self) -> None:
-        def handler(request: httpx.Request) -> httpx.Response:
-            assert request.url.path == "/api/pull"
-            body = json.loads(request.content)
-            assert body["stream"] is False
-            return httpx.Response(200, json={"status": "success"})
-
-        client = self._client_with_handler(handler)
+        client, _, pull_sdk = self._client_with_mock()
+        pull_sdk.pull.return_value = [
+            SimpleNamespace(status="pulling manifest"),
+            SimpleNamespace(status="success"),
+        ]
         client.pull_model("llama3.2")
-        client.close()
-
-    def test_pull_model_failure_status(self) -> None:
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json={"status": "error", "error": "nope"})
-
-        client = self._client_with_handler(handler)
-        with pytest.raises(RuntimeError, match="Pull failed"):
-            client.pull_model("bad")
+        pull_sdk.pull.assert_called_once_with("llama3.2", stream=True)
         client.close()
 
     def test_delete_model(self) -> None:
-        def handler(request: httpx.Request) -> httpx.Response:
-            assert request.method == "DELETE"
-            assert request.url.path == "/api/delete"
-            return httpx.Response(200)
-
-        client = self._client_with_handler(handler)
+        client, sdk, _ = self._client_with_mock()
         client.delete_model("llama3.2")
+        sdk.delete.assert_called_once_with("llama3.2")
         client.close()
 
     def test_delete_model_not_found(self) -> None:
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(404)
-
-        client = self._client_with_handler(handler)
+        client, sdk, _ = self._client_with_mock()
+        sdk.delete.side_effect = ResponseError("missing", 404)
         client.delete_model("missing")
         client.close()
 
     def test_model_is_available(self) -> None:
-        def handler(request: httpx.Request) -> httpx.Response:
-            if request.url.path == "/api/show":
-                return httpx.Response(200, json={"capabilities": []})
-            return httpx.Response(404)
-
-        client = self._client_with_handler(handler)
+        client, sdk, _ = self._client_with_mock()
+        sdk.show.return_value = SimpleNamespace(model_dump=lambda: {"capabilities": []})
         assert client.model_is_available("m") is True
+        client.close()
+
+    def test_model_is_available_false(self) -> None:
+        client, sdk, _ = self._client_with_mock()
+        sdk.show.side_effect = ResponseError("missing", 404)
+        assert client.model_is_available("m") is False
         client.close()

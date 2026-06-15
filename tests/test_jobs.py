@@ -133,7 +133,7 @@ class TestExecuteJob:
         with tmp_db.session() as conn:
             job = tmp_db.claim_next_job(conn)
             assert job is not None
-            _execute_job(tmp_db, conn, client, job, "system")
+            _execute_job(tmp_db, conn, client, job, "system", progress="[test 1/1]")
             status = conn.execute(
                 "SELECT status FROM jobs WHERE id = ?", (job.id,)
             ).fetchone()
@@ -164,7 +164,7 @@ class TestExecuteJob:
         client = mock.Mock(spec=OllamaClient)
         with tmp_db.session() as conn:
             job = tmp_db.claim_next_job(conn)
-            _execute_job(tmp_db, conn, client, job, "system")
+            _execute_job(tmp_db, conn, client, job, "system", progress="[test 1/1]")
             status = conn.execute(
                 "SELECT status, last_error FROM jobs WHERE id = ?", (job.id,)
             ).fetchone()
@@ -186,7 +186,7 @@ class TestExecuteJob:
         )
         with tmp_db.session() as conn:
             job = tmp_db.claim_next_job(conn)
-            _execute_job(tmp_db, conn, client, job, "system")
+            _execute_job(tmp_db, conn, client, job, "system", progress="[test 1/1]")
             status = conn.execute(
                 "SELECT status FROM jobs WHERE id = ?", (job.id,)
             ).fetchone()
@@ -228,7 +228,7 @@ class TestExecuteJob:
         )
         with tmp_db.session() as conn:
             job = tmp_db.claim_next_job(conn)
-            _execute_job(tmp_db, conn, client, job, "system")
+            _execute_job(tmp_db, conn, client, job, "system", progress="[test 1/1]")
         mock_encode.assert_called_once()
         client.chat.assert_called_once()
         assert client.chat.call_args.kwargs["audio_b64"] == "YmFzZTY0"
@@ -293,7 +293,19 @@ class TestRunJobs:
         )
         prefetch = mock_prefetch_cls.return_value
         run_jobs(config)
+        prefetch.ensure_pulled.assert_called()
         prefetch.schedule_pull.assert_called_with("model-b")
+        ensure_index = next(
+            i
+            for i, call in enumerate(prefetch.method_calls)
+            if call[0] == "ensure_pulled"
+        )
+        schedule_index = next(
+            i
+            for i, call in enumerate(prefetch.method_calls)
+            if call[0] == "schedule_pull"
+        )
+        assert ensure_index < schedule_index
 
     @mock.patch("sarcasm_detector.jobs.ModelPrefetcher")
     @mock.patch("sarcasm_detector.jobs.OllamaClient")
@@ -343,6 +355,72 @@ class TestRunJobs:
             status = conn.execute("SELECT status FROM jobs").fetchone()
         assert status["status"] == "completed"
 
+    @mock.patch("sarcasm_detector.jobs.ModelPrefetcher")
+    @mock.patch("sarcasm_detector.jobs.OllamaClient")
+    def test_run_jobs_skips_model_with_no_pending(
+        self,
+        mock_client_cls: mock.Mock,
+        mock_prefetch_cls: mock.Mock,
+        config_with_db: Config,
+        tmp_db: Database,
+        seed_clip_with_job,
+    ) -> None:
+        config = config_with_db
+        config.models_path.write_text("done-model\npending-model\n")
+        seed_clip_with_job(tmp_db)
+        with tmp_db.session() as conn:
+            clip_id = conn.execute("SELECT id FROM clips").fetchone()["id"]
+            done_model_id = tmp_db.upsert_model(conn, "done-model")
+            pending_model_id = tmp_db.upsert_model(conn, "pending-model")
+            tmp_db.ensure_jobs_for_clip(
+                conn,
+                clip_id,
+                [done_model_id, pending_model_id],
+                {("text", "en")},
+            )
+            conn.execute(
+                "UPDATE jobs SET status = 'completed' WHERE model_id = ?",
+                (done_model_id,),
+            )
+
+        mock_client_cls.return_value.model_supports_audio.return_value = (False, [])
+        mock_client_cls.return_value.chat.return_value = ChatResult(
+            raw_body="ok",
+            http_status=200,
+            duration_ms=1,
+            request_payload={},
+        )
+        prefetch = mock_prefetch_cls.return_value
+        run_jobs(config)
+        prefetch.ensure_pulled.assert_called_once_with("pending-model")
+
+    @mock.patch("sarcasm_detector.jobs.ModelPrefetcher")
+    @mock.patch("sarcasm_detector.jobs.OllamaClient")
+    def test_run_jobs_logs_startup_summary(
+        self,
+        mock_client_cls: mock.Mock,
+        mock_prefetch_cls: mock.Mock,
+        config_with_db: Config,
+        tmp_db: Database,
+        seed_clip_with_job,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        config = config_with_db
+        seed_clip_with_job(tmp_db)
+        mock_client_cls.return_value.model_supports_audio.return_value = (False, [])
+        mock_client_cls.return_value.chat.return_value = ChatResult(
+            raw_body="ok",
+            http_status=200,
+            duration_ms=1,
+            request_payload={},
+        )
+        run_jobs(config)
+        messages = capsys.readouterr().err
+        assert "Starting evaluation run" in messages
+        assert "Dataset:" in messages
+        assert "Run complete:" in messages
+        assert "Final job status:" in messages
+
     @mock.patch("sarcasm_detector.jobs.OllamaClient")
     def test_run_jobs_no_models(self, mock_client_cls: mock.Mock, config: Config) -> None:
         config.models_path.write_text("# empty\n")
@@ -355,6 +433,7 @@ class TestRunStatus:
         config.sqlite_db.parent.mkdir(parents=True, exist_ok=True)
         run_status(config)
         out = capsys.readouterr().out
+        assert "Models: 1" in out
         assert "Clips: 0" in out
         assert "none (run import first)" in out
 
@@ -365,5 +444,7 @@ class TestRunStatus:
         seed_clip_with_job(tmp_db)
         run_status(config)
         out = capsys.readouterr().out
+        assert "Models: 1" in out
         assert "Clips: 1" in out
-        assert "pending" in out
+        assert "Jobs to run: 1" in out
+        assert "pending: 1" in out

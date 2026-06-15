@@ -452,6 +452,19 @@ class Database:
         ).fetchall()
         return {str(r["status"]): int(r["cnt"]) for r in rows}
 
+    def job_status_counts_for_model(
+        self, conn: sqlite3.Connection, model_id: int
+    ) -> dict[str, int]:
+        rows = conn.execute(
+            """
+            SELECT status, COUNT(*) AS cnt FROM jobs
+            WHERE model_id = ?
+            GROUP BY status
+            """,
+            (model_id,),
+        ).fetchall()
+        return {str(r["status"]): int(r["cnt"]) for r in rows}
+
     def list_model_ids(self, conn: sqlite3.Connection) -> list[tuple[int, str]]:
         rows = conn.execute("SELECT id, name FROM models ORDER BY id").fetchall()
         return [(int(r["id"]), str(r["name"])) for r in rows]

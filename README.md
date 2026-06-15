@@ -64,6 +64,18 @@ chmod +x scripts/run_eval.sh
 ./scripts/run_eval.sh
 ```
 
+### Reload models without re-importing
+
+After editing `models.txt`, sync models and create missing evaluation jobs without touching clip data:
+
+```bash
+python -m sarcasm_detector sync-models
+```
+
+This is safe to run at any time: existing clips, assets, and completed jobs are preserved. Re-running `import` is also safe (existing clips are skipped), but `sync-models` is faster when only the model list changed.
+
+`status` applies the same model sync automatically so `Jobs to run` reflects the current `models.txt`.
+
 ### 4. Check status
 
 ```bash
@@ -82,6 +94,7 @@ sqlite3 sarcasm.db "SELECT raw_response_body FROM job_outputs LIMIT 1;"
 | `RAW_DATA_DIR` | `raw_data` | Directory with clip archives |
 | `SYSTEM_PROMPT_PATH` | `system_prompt.txt` | System prompt file |
 | `MODELS_PATH` | `models.txt` | One Ollama model per line |
+| `LOG_LEVEL` | `INFO` | Runner log verbosity (`DEBUG`, `INFO`, `WARNING`, …) |
 
 Audio jobs are skipped automatically for models that do not report `audio` capability via Ollama's `/api/show` endpoint.
 
