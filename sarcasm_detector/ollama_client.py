@@ -156,6 +156,7 @@ class OllamaClient:
             "model": model,
             "messages": messages,
             "stream": False,
+            "think": False,
             "options": {"num_predict": MAX_GENERATED_TOKENS},
         }
 
@@ -165,6 +166,7 @@ class OllamaClient:
                 model=model,
                 messages=messages,
                 stream=False,
+                think=False,
                 options={"num_predict": MAX_GENERATED_TOKENS},
             )
             duration_ms = int((time.monotonic() - start) * 1000)

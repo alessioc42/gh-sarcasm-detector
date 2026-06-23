@@ -102,6 +102,7 @@ class TestOllamaClient:
         messages = sdk.chat.call_args.kwargs["messages"]
         assert messages[0]["role"] == "system"
         assert messages[1]["images"] == ["abc"]
+        assert sdk.chat.call_args.kwargs["think"] is False
         assert sdk.chat.call_args.kwargs["options"] == {
             "num_predict": MAX_GENERATED_TOKENS
         }

@@ -7,3 +7,4 @@ gemma4:e4b
 gemma4:12b
 deepseek-r1:8b
 granite4.1:8b
+gemma4:26b
