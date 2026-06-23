@@ -13,7 +13,7 @@ from sarcasm_detector.import_raw import (
     available_job_pairs,
     classify_file,
     collect_clip,
-    ensure_jobs_for_new_models,
+    ensure_jobs_for_clips,
     extract_archive,
     find_clip_directories,
     import_archive,
@@ -148,17 +148,25 @@ class TestImportArchive:
     def test_import_and_idempotent(self, tmp_db, sample_zip: Path) -> None:
         with tmp_db.session() as conn:
             model_id = tmp_db.upsert_model(conn, "m1")
-            imported, jobs = import_archive(tmp_db, conn, sample_zip, [model_id])
+            prompt_id = tmp_db.upsert_prompt(conn, "default", "default.txt")
+            imported, jobs = import_archive(
+                tmp_db, conn, sample_zip, [model_id], [prompt_id]
+            )
             assert imported == 1
             assert jobs == 4
-            imported2, jobs2 = import_archive(tmp_db, conn, sample_zip, [model_id])
+            imported2, jobs2 = import_archive(
+                tmp_db, conn, sample_zip, [model_id], [prompt_id]
+            )
             assert imported2 == 0
             assert jobs2 == 0
 
     def test_import_deadpool(self, tmp_db, deadpool_zip: Path) -> None:
         with tmp_db.session() as conn:
             model_id = tmp_db.upsert_model(conn, "m1")
-            imported, _ = import_archive(tmp_db, conn, deadpool_zip, [model_id])
+            prompt_id = tmp_db.upsert_prompt(conn, "default", "default.txt")
+            imported, _ = import_archive(
+                tmp_db, conn, deadpool_zip, [model_id], [prompt_id]
+            )
             assets = tmp_db.get_clip_assets(
                 conn,
                 conn.execute("SELECT id FROM clips").fetchone()["id"],
@@ -170,9 +178,22 @@ class TestImportArchive:
     def test_import_werner_tar(self, tmp_db, werner_tar: Path) -> None:
         with tmp_db.session() as conn:
             model_id = tmp_db.upsert_model(conn, "m1")
-            imported, jobs = import_archive(tmp_db, conn, werner_tar, [model_id])
+            prompt_id = tmp_db.upsert_prompt(conn, "default", "default.txt")
+            imported, jobs = import_archive(
+                tmp_db, conn, werner_tar, [model_id], [prompt_id]
+            )
         assert imported == 1
         assert jobs == 2
+
+    def test_import_creates_jobs_per_prompt(self, tmp_db, sample_zip: Path) -> None:
+        with tmp_db.session() as conn:
+            model_id = tmp_db.upsert_model(conn, "m1")
+            prompt_a = tmp_db.upsert_prompt(conn, "a", "a.txt")
+            prompt_b = tmp_db.upsert_prompt(conn, "b", "b.txt")
+            _, jobs = import_archive(
+                tmp_db, conn, sample_zip, [model_id], [prompt_a, prompt_b]
+            )
+        assert jobs == 8
 
     def test_run_import_no_archives(
         self, config: Config, capsys: pytest.CaptureFixture[str]
@@ -214,12 +235,13 @@ class TestImportArchive:
             assert db.count_clips(conn) == 1
             assert db.job_status_counts(conn)["pending"] == 4
 
-    def test_ensure_jobs_for_new_models(self, tmp_db, sample_zip: Path) -> None:
+    def test_ensure_jobs_for_clips(self, tmp_db, sample_zip: Path) -> None:
         with tmp_db.session() as conn:
             model_a = tmp_db.upsert_model(conn, "model-a")
-            import_archive(tmp_db, conn, sample_zip, [model_a])
+            prompt_id = tmp_db.upsert_prompt(conn, "default", "default.txt")
+            import_archive(tmp_db, conn, sample_zip, [model_a], [prompt_id])
             model_b = tmp_db.upsert_model(conn, "model-b")
-            created = ensure_jobs_for_new_models(tmp_db, conn, [model_b])
+            created = ensure_jobs_for_clips(tmp_db, conn, [model_b], [prompt_id])
             assert created == 4
             assert sync_models(tmp_db, conn, ["model-a", "model-b"]) == [model_a, model_b]
 

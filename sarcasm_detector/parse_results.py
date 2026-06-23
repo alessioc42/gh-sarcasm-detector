@@ -13,7 +13,6 @@ logger = logging.getLogger(__name__)
 VERDICT_SARCASTIC = "SARCASTIC"
 VERDICT_NOT_SARCASTIC = "NOT_SARCASTIC"
 VERDICT_LLM_ERR = "LLM_ERR"
-VERDICT_EXEC_ERR = "EXEC_ERR"
 
 _FENCE_RE = re.compile(
     r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", re.DOTALL | re.IGNORECASE
@@ -136,25 +135,7 @@ def find_schema_json(text: str) -> ParsedFields | None:
     return _find_schema_json_in_text(text)
 
 
-def classify_job(
-    *,
-    status: str,
-    raw_body: str | None,
-    last_error: str | None,
-    output_error: str | None,
-) -> ParsedVerdict:
-    if status in {"failed", "skipped"}:
-        detail = last_error or output_error or status
-        return ParsedVerdict(
-            verdict=VERDICT_EXEC_ERR,
-            sarcastic=None,
-            confidence=None,
-            parse_error=detail,
-        )
-
-    if status != "completed":
-        raise ValueError(f"unexpected job status for parsing: {status}")
-
+def classify_completed_response(*, raw_body: str | None) -> ParsedVerdict:
     assistant_text = extract_assistant_text(raw_body)
     fields = find_schema_json(assistant_text)
     if fields is None:
@@ -178,15 +159,17 @@ def run_parse(config: Config) -> None:
     db = Database(config.sqlite_db)
     db.initialize()
 
-    skipped = 0
+    skipped_unparsed = 0
     counts: dict[str, int] = {}
 
     with db.session() as conn:
         jobs = db.list_jobs_for_parsing(conn)
 
     for job in jobs:
-        if job.status in {"pending", "running"}:
-            skipped += 1
+        if job.status != "completed":
+            with db.session() as conn:
+                db.delete_job_verdict(conn, job.id)
+            skipped_unparsed += 1
             continue
 
         with db.session() as conn:
@@ -196,17 +179,7 @@ def run_parse(config: Config) -> None:
                 if output and output["raw_response_body"]
                 else None
             )
-            output_error = (
-                str(output["error_message"])
-                if output and output["error_message"]
-                else None
-            )
-            parsed = classify_job(
-                status=job.status,
-                raw_body=raw_body,
-                last_error=job.last_error,
-                output_error=output_error,
-            )
+            parsed = classify_completed_response(raw_body=raw_body)
             db.upsert_job_verdict(
                 conn,
                 job_id=job.id,
@@ -218,10 +191,10 @@ def run_parse(config: Config) -> None:
 
         counts[parsed.verdict] = counts.get(parsed.verdict, 0) + 1
 
-    if skipped:
-        logger.warning(
-            "Skipped %d jobs still pending or running (no verdict written)",
-            skipped,
+    if skipped_unparsed:
+        logger.info(
+            "Skipped %d non-completed jobs (no verdict written)",
+            skipped_unparsed,
         )
 
     logger.info(

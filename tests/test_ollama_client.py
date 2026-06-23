@@ -31,8 +31,8 @@ class TestRedactPayload:
 
 
 class TestMaxGeneratedTokens:
-    def test_limit_is_eight_times_json_estimate(self) -> None:
-        assert MAX_GENERATED_TOKENS == 15 * 8
+    def test_limit_is_forty_times_json_estimate(self) -> None:
+        assert MAX_GENERATED_TOKENS == 15 * 40
 
 
 class TestOllamaClient:
@@ -149,6 +149,37 @@ class TestOllamaClient:
         client, sdk, _ = self._client_with_mock()
         sdk.delete.side_effect = ResponseError("missing", 404)
         client.delete_model("missing")
+        client.close()
+
+    def test_list_installed_models(self) -> None:
+        client, sdk, _ = self._client_with_mock()
+        sdk.list.return_value = SimpleNamespace(
+            model_dump=lambda: {
+                "models": [
+                    {
+                        "name": "llama3.2:latest",
+                        "size": 1234567890,
+                        "modified_at": "2024-01-01T00:00:00Z",
+                    },
+                ]
+            }
+        )
+        installed = client.list_installed_models()
+        assert len(installed) == 1
+        assert installed[0].name == "llama3.2:latest"
+        assert installed[0].size_bytes == 1234567890
+        assert installed[0].modified_at == "2024-01-01T00:00:00Z"
+        client.close()
+
+    def test_installed_model_size(self) -> None:
+        client, sdk, _ = self._client_with_mock()
+        sdk.list.return_value = SimpleNamespace(
+            model_dump=lambda: {
+                "models": [{"name": "m1", "size": 42, "modified_at": None}]
+            }
+        )
+        assert client.installed_model_size("m1") == 42
+        assert client.installed_model_size("missing") is None
         client.close()
 
     def test_model_is_available(self) -> None:

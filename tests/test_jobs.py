@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from unittest import mock
 
 import pytest
@@ -103,8 +104,13 @@ class TestSyncModelCapabilities:
                 original_filename="en.mp3",
             )
             model_id = tmp_db.upsert_model(conn, "text-only")
+            prompt_id = tmp_db.upsert_prompt(conn, "default", "default.txt")
             tmp_db.ensure_jobs_for_clip(
-                conn, clip_id, [model_id], {("text", "en"), ("audio", "en")}
+                conn,
+                clip_id,
+                [model_id],
+                [prompt_id],
+                {("text", "en"), ("audio", "en")},
             )
 
         client = mock.Mock(spec=OllamaClient)
@@ -120,7 +126,7 @@ class TestSyncModelCapabilities:
 
 class TestExecuteJob:
     def test_execute_text_job_success(
-        self, tmp_db: Database, seed_clip_with_job
+        self, tmp_db: Database, seed_clip_with_job, config: Config
     ) -> None:
         seed_clip_with_job(tmp_db)
         client = mock.Mock(spec=OllamaClient)
@@ -133,7 +139,7 @@ class TestExecuteJob:
         with tmp_db.session() as conn:
             job = tmp_db.claim_next_job(conn)
             assert job is not None
-            _execute_job(tmp_db, conn, client, job, "system", progress="[test 1/1]")
+            _execute_job(tmp_db, conn, client, job, config, progress="[test 1/1]")
             status = conn.execute(
                 "SELECT status FROM jobs WHERE id = ?", (job.id,)
             ).fetchone()
@@ -143,8 +149,10 @@ class TestExecuteJob:
             ).fetchone()
         assert status["status"] == "completed"
         assert "sarcastic" in output["raw_response_body"]
+        client.chat.assert_called_once()
+        assert client.chat.call_args.kwargs["system_prompt"] == "You are a test prompt."
 
-    def test_execute_job_missing_asset_fails(self, tmp_db: Database) -> None:
+    def test_execute_job_missing_asset_fails(self, tmp_db: Database, config: Config) -> None:
         with tmp_db.session() as conn:
             series_id = tmp_db.get_or_create_series(conn, "Show")
             clip_id = tmp_db.insert_clip(
@@ -159,21 +167,26 @@ class TestExecuteJob:
                 ground_truth_sarcasm=True,
             )
             model_id = tmp_db.upsert_model(conn, "m")
-            tmp_db.ensure_jobs_for_clip(conn, clip_id, [model_id], {("text", "en")})
+            prompt_id = tmp_db.upsert_prompt(conn, "default", "default.txt")
+            tmp_db.ensure_jobs_for_clip(
+                conn, clip_id, [model_id], [prompt_id], {("text", "en")}
+            )
 
         client = mock.Mock(spec=OllamaClient)
         with tmp_db.session() as conn:
             job = tmp_db.claim_next_job(conn)
-            _execute_job(tmp_db, conn, client, job, "system", progress="[test 1/1]")
+            _execute_job(tmp_db, conn, client, job, config, progress="[test 1/1]")
             status = conn.execute(
-                "SELECT status, last_error FROM jobs WHERE id = ?", (job.id,)
+                "SELECT status, last_error, failure_kind FROM jobs WHERE id = ?",
+                (job.id,),
             ).fetchone()
         assert status["status"] == "failed"
         assert "Missing text" in status["last_error"]
+        assert status["failure_kind"] == "missing_asset"
         client.chat.assert_not_called()
 
-    def test_execute_job_chat_failure(
-        self, tmp_db: Database, seed_clip_with_job
+    def test_execute_job_chat_failure_requeues(
+        self, tmp_db: Database, seed_clip_with_job, config: Config
     ) -> None:
         seed_clip_with_job(tmp_db)
         client = mock.Mock(spec=OllamaClient)
@@ -186,14 +199,38 @@ class TestExecuteJob:
         )
         with tmp_db.session() as conn:
             job = tmp_db.claim_next_job(conn)
-            _execute_job(tmp_db, conn, client, job, "system", progress="[test 1/1]")
+            _execute_job(tmp_db, conn, client, job, config, progress="[test 1/1]")
             status = conn.execute(
                 "SELECT status FROM jobs WHERE id = ?", (job.id,)
             ).fetchone()
+        assert status["status"] == "pending"
+
+    def test_execute_job_chat_failure_exhausts_retries(
+        self, tmp_db: Database, seed_clip_with_job, config: Config
+    ) -> None:
+        config = replace(config, max_job_attempts=1)
+        seed_clip_with_job(tmp_db)
+        client = mock.Mock(spec=OllamaClient)
+        client.chat.return_value = ChatResult(
+            raw_body="error",
+            http_status=500,
+            duration_ms=5,
+            request_payload={},
+            error_message="HTTP 500",
+        )
+        with tmp_db.session() as conn:
+            job = tmp_db.claim_next_job(conn)
+            _execute_job(tmp_db, conn, client, job, config, progress="[test 1/1]")
+            status = conn.execute(
+                "SELECT status, failure_kind FROM jobs WHERE id = ?", (job.id,)
+            ).fetchone()
         assert status["status"] == "failed"
+        assert status["failure_kind"] == "inference_error"
 
     @mock.patch("sarcasm_detector.jobs.encode_audio_base64", return_value="YmFzZTY0")
-    def test_execute_audio_job(self, mock_encode: mock.Mock, tmp_db: Database) -> None:
+    def test_execute_audio_job(
+        self, mock_encode: mock.Mock, tmp_db: Database, config: Config
+    ) -> None:
         with tmp_db.session() as conn:
             series_id = tmp_db.get_or_create_series(conn, "Show")
             clip_id = tmp_db.insert_clip(
@@ -217,7 +254,10 @@ class TestExecuteJob:
                 original_filename="en.mp3",
             )
             model_id = tmp_db.upsert_model(conn, "m")
-            tmp_db.ensure_jobs_for_clip(conn, clip_id, [model_id], {("audio", "en")})
+            prompt_id = tmp_db.upsert_prompt(conn, "default", "default.txt")
+            tmp_db.ensure_jobs_for_clip(
+                conn, clip_id, [model_id], [prompt_id], {("audio", "en")}
+            )
 
         client = mock.Mock(spec=OllamaClient)
         client.chat.return_value = ChatResult(
@@ -228,19 +268,21 @@ class TestExecuteJob:
         )
         with tmp_db.session() as conn:
             job = tmp_db.claim_next_job(conn)
-            _execute_job(tmp_db, conn, client, job, "system", progress="[test 1/1]")
+            _execute_job(tmp_db, conn, client, job, config, progress="[test 1/1]")
         mock_encode.assert_called_once()
         client.chat.assert_called_once()
         assert client.chat.call_args.kwargs["audio_b64"] == "YmFzZTY0"
 
 
 class TestRunJobs:
+    @mock.patch("sarcasm_detector.jobs.ModelCacheManager")
     @mock.patch("sarcasm_detector.jobs.ModelPrefetcher")
     @mock.patch("sarcasm_detector.jobs.OllamaClient")
     def test_run_jobs_processes_queue(
         self,
         mock_client_cls: mock.Mock,
         mock_prefetch_cls: mock.Mock,
+        mock_cache_cls: mock.Mock,
         config_with_db: Config,
         tmp_db: Database,
         seed_clip_with_job,
@@ -256,18 +298,23 @@ class TestRunJobs:
             request_payload={},
         )
         prefetch = mock_prefetch_cls.return_value
+        cache = mock_cache_cls.return_value
         run_jobs(config)
         prefetch.ensure_pulled.assert_called()
-        instance.delete_model.assert_called()
+        instance.delete_model.assert_not_called()
+        cache.mark_done.assert_called()
+        cache.log_cache_summary.assert_called_once()
         instance.close.assert_called_once()
         prefetch.cancel_all.assert_called_once()
 
+    @mock.patch("sarcasm_detector.jobs.ModelCacheManager")
     @mock.patch("sarcasm_detector.jobs.ModelPrefetcher")
     @mock.patch("sarcasm_detector.jobs.OllamaClient")
     def test_run_jobs_prefetches_next_model(
         self,
         mock_client_cls: mock.Mock,
         mock_prefetch_cls: mock.Mock,
+        mock_cache_cls: mock.Mock,
         config_with_db: Config,
         tmp_db: Database,
         seed_clip_with_job,
@@ -277,10 +324,12 @@ class TestRunJobs:
         seed_clip_with_job(tmp_db)
         with tmp_db.session() as conn:
             model_b = tmp_db.upsert_model(conn, "model-b")
+            prompt_id = tmp_db.upsert_prompt(conn, "default", "default.txt")
             tmp_db.ensure_jobs_for_clip(
                 conn,
                 conn.execute("SELECT id FROM clips").fetchone()["id"],
                 [model_b],
+                [prompt_id],
                 {("text", "en")},
             )
 
@@ -307,12 +356,14 @@ class TestRunJobs:
         )
         assert ensure_index < schedule_index
 
+    @mock.patch("sarcasm_detector.jobs.ModelCacheManager")
     @mock.patch("sarcasm_detector.jobs.ModelPrefetcher")
     @mock.patch("sarcasm_detector.jobs.OllamaClient")
-    def test_run_jobs_pull_failure_marks_jobs_failed(
+    def test_run_jobs_pull_failure_leaves_jobs_pending(
         self,
         mock_client_cls: mock.Mock,
         mock_prefetch_cls: mock.Mock,
+        mock_cache_cls: mock.Mock,
         config_with_db: Config,
         tmp_db: Database,
         seed_clip_with_job,
@@ -324,14 +375,16 @@ class TestRunJobs:
         run_jobs(config)
         with tmp_db.session() as conn:
             status = conn.execute("SELECT status FROM jobs").fetchone()
-        assert status["status"] == "failed"
+        assert status["status"] == "pending"
 
+    @mock.patch("sarcasm_detector.jobs.ModelCacheManager")
     @mock.patch("sarcasm_detector.jobs.ModelPrefetcher")
     @mock.patch("sarcasm_detector.jobs.OllamaClient")
     def test_run_jobs_resets_stuck(
         self,
         mock_client_cls: mock.Mock,
         mock_prefetch_cls: mock.Mock,
+        mock_cache_cls: mock.Mock,
         config_with_db: Config,
         tmp_db: Database,
         seed_clip_with_job,
@@ -355,12 +408,14 @@ class TestRunJobs:
             status = conn.execute("SELECT status FROM jobs").fetchone()
         assert status["status"] == "completed"
 
+    @mock.patch("sarcasm_detector.jobs.ModelCacheManager")
     @mock.patch("sarcasm_detector.jobs.ModelPrefetcher")
     @mock.patch("sarcasm_detector.jobs.OllamaClient")
     def test_run_jobs_skips_model_with_no_pending(
         self,
         mock_client_cls: mock.Mock,
         mock_prefetch_cls: mock.Mock,
+        mock_cache_cls: mock.Mock,
         config_with_db: Config,
         tmp_db: Database,
         seed_clip_with_job,
@@ -372,10 +427,12 @@ class TestRunJobs:
             clip_id = conn.execute("SELECT id FROM clips").fetchone()["id"]
             done_model_id = tmp_db.upsert_model(conn, "done-model")
             pending_model_id = tmp_db.upsert_model(conn, "pending-model")
+            prompt_id = tmp_db.upsert_prompt(conn, "default", "default.txt")
             tmp_db.ensure_jobs_for_clip(
                 conn,
                 clip_id,
                 [done_model_id, pending_model_id],
+                [prompt_id],
                 {("text", "en")},
             )
             conn.execute(
@@ -394,12 +451,14 @@ class TestRunJobs:
         run_jobs(config)
         prefetch.ensure_pulled.assert_called_once_with("pending-model")
 
+    @mock.patch("sarcasm_detector.jobs.ModelCacheManager")
     @mock.patch("sarcasm_detector.jobs.ModelPrefetcher")
     @mock.patch("sarcasm_detector.jobs.OllamaClient")
     def test_run_jobs_logs_startup_summary(
         self,
         mock_client_cls: mock.Mock,
         mock_prefetch_cls: mock.Mock,
+        mock_cache_cls: mock.Mock,
         config_with_db: Config,
         tmp_db: Database,
         seed_clip_with_job,
@@ -427,6 +486,13 @@ class TestRunJobs:
         run_jobs(config)
         mock_client_cls.assert_not_called()
 
+    @mock.patch("sarcasm_detector.jobs.OllamaClient")
+    def test_run_jobs_no_prompts(self, mock_client_cls: mock.Mock, config: Config) -> None:
+        for path in config.prompts_dir.glob("*.txt"):
+            path.unlink()
+        run_jobs(config)
+        mock_client_cls.assert_not_called()
+
 
 class TestRunStatus:
     def test_run_status_empty(self, config, capsys: pytest.CaptureFixture[str]) -> None:
@@ -434,6 +500,7 @@ class TestRunStatus:
         run_status(config)
         out = capsys.readouterr().out
         assert "Models: 1" in out
+        assert "Prompts: 1" in out
         assert "Clips: 0" in out
         assert "none (run import first)" in out
 
@@ -465,5 +532,5 @@ class TestRunStatus:
             )
         run_status(config_with_db)
         out = capsys.readouterr().out
-        assert "Verdicts:" in out
+        assert "Verdicts (completed jobs only):" in out
         assert "SARCASTIC: 1" in out

@@ -4,9 +4,15 @@ import logging
 
 from .audio_util import encode_audio_base64
 from .config import Config
-from .db import Database, JobRecord
-from .import_raw import sync_models_from_config
+from .db import (
+    FAILURE_KIND_INFERENCE_ERROR,
+    FAILURE_KIND_MISSING_ASSET,
+    Database,
+    JobRecord,
+)
+from .import_raw import sync_from_config
 from .logging_config import configure_logging
+from .model_cache import ModelCacheManager, pending_eval_model_names
 from .model_prefetch import ModelPrefetcher
 from .ollama_client import OllamaClient
 
@@ -81,20 +87,58 @@ def _sync_model_capabilities(
     return skipped
 
 
+def _handle_inference_failure(
+    db: Database,
+    conn,
+    job: JobRecord,
+    error_message: str,
+    *,
+    max_job_attempts: int,
+) -> None:
+    if job.attempt_count < max_job_attempts:
+        db.requeue_job(conn, job.id, last_error=error_message)
+        logger.warning(
+            "Job %d failed (attempt %d/%d), requeued: %s",
+            job.id,
+            job.attempt_count,
+            max_job_attempts,
+            error_message,
+        )
+        return
+
+    db.finish_job(
+        conn,
+        job.id,
+        "failed",
+        last_error=error_message,
+        failure_kind=FAILURE_KIND_INFERENCE_ERROR,
+    )
+    logger.error(
+        "Job %d failed permanently after %d attempts (%s/%s/%s): %s",
+        job.id,
+        job.attempt_count,
+        job.model_name,
+        job.modality,
+        job.language,
+        error_message,
+    )
+
+
 def _execute_job(
     db: Database,
     conn,
     client: OllamaClient,
     job: JobRecord,
-    system_prompt: str,
+    config: Config,
     *,
     progress: str,
 ) -> None:
     logger.info(
-        "%s job %d: clip %d, %s/%s",
+        "%s job %d: clip %d, prompt %s, %s/%s",
         progress,
         job.id,
         job.clip_id,
+        job.prompt_slug,
         job.modality,
         job.language,
     )
@@ -104,7 +148,13 @@ def _execute_job(
             _build_user_message(assets, job.modality, job.language)
         )
     except ValueError as exc:
-        db.finish_job(conn, job.id, "failed", last_error=str(exc))
+        db.finish_job(
+            conn,
+            job.id,
+            "failed",
+            last_error=str(exc),
+            failure_kind=FAILURE_KIND_MISSING_ASSET,
+        )
         db.insert_job_output(
             conn,
             job_id=job.id,
@@ -126,6 +176,7 @@ def _execute_job(
             original_filename=audio_filename,
         )
 
+    system_prompt = config.read_prompt_text(job.prompt_slug)
     result = client.chat(
         model=job.model_name,
         system_prompt=system_prompt,
@@ -144,23 +195,22 @@ def _execute_job(
     )
 
     if result.error_message:
-        db.finish_job(conn, job.id, "failed", last_error=result.error_message)
-        logger.error(
-            "Job %d failed (%s/%s/%s): %s",
-            job.id,
-            job.model_name,
-            job.modality,
-            job.language,
+        _handle_inference_failure(
+            db,
+            conn,
+            job,
             result.error_message,
+            max_job_attempts=config.max_job_attempts,
         )
     else:
         db.finish_job(conn, job.id, "completed")
         logger.info(
-            "Job %d completed (%s/%s/%s) in %dms",
+            "Job %d completed (%s/%s/%s, prompt=%s) in %dms",
             job.id,
             job.model_name,
             job.modality,
             job.language,
+            job.prompt_slug,
             result.duration_ms,
         )
 
@@ -170,7 +220,7 @@ def _run_jobs_for_model(
     client: OllamaClient,
     model_id: int,
     model_name: str,
-    system_prompt: str,
+    config: Config,
     *,
     pending_total: int,
 ) -> int:
@@ -181,9 +231,7 @@ def _run_jobs_for_model(
             if job is None:
                 break
             progress = f"[{model_name} {processed + 1}/{pending_total}]"
-            _execute_job(
-                db, conn, client, job, system_prompt, progress=progress
-            )
+            _execute_job(db, conn, client, job, config, progress=progress)
             processed += 1
     return processed
 
@@ -198,6 +246,11 @@ def run_jobs(config: Config) -> None:
         logger.error("No models listed in %s", config.models_path)
         return
 
+    prompts = config.load_prompts()
+    if not prompts:
+        logger.error("No .txt prompt files found in %s", config.prompts_dir)
+        return
+
     logger.info("Starting evaluation run")
     logger.info("Database: %s", config.sqlite_db)
     logger.info("Ollama endpoint: %s", config.ollama_endpoint)
@@ -206,23 +259,53 @@ def run_jobs(config: Config) -> None:
         len(model_names),
         config.models_path,
     )
+    logger.info(
+        "Prompts: %d from %s (max attempts per job: %d)",
+        len(prompts),
+        config.prompts_dir,
+        config.max_job_attempts,
+    )
 
-    system_prompt = config.load_system_prompt()
     client = OllamaClient(config.ollama_endpoint, config.ollama_api_token)
-    prefetcher = ModelPrefetcher(client)
+    cache = ModelCacheManager(client, config)
+    current_model: list[str] = [""]
+    remaining_models: set[str] = set(model_names)
+    prefetcher: ModelPrefetcher | None = None
+
+    def protected_supplier() -> set[str]:
+        protected = set(remaining_models)
+        if current_model[0]:
+            protected.add(current_model[0])
+        if prefetcher is not None:
+            protected |= prefetcher.scheduled_models()
+        protected |= pending_eval_model_names(db, model_names)
+        return protected
+
+    def pending_supplier() -> set[str]:
+        return pending_eval_model_names(db, model_names)
+
+    prefetcher = ModelPrefetcher(
+        client,
+        cache,
+        eval_models=model_names,
+        protected_supplier=protected_supplier,
+        pending_supplier=pending_supplier,
+    )
 
     try:
         with db.session() as conn:
-            _, model_ids, jobs_created = sync_models_from_config(db, conn, config)
+            _, model_ids, synced_prompt_ids, jobs_created = sync_from_config(
+                db, conn, config
+            )
             clips = db.count_clips(conn)
             counts = db.job_status_counts(conn)
             reset = db.reset_running_jobs(conn)
 
         pending_total = counts.get("pending", 0)
         logger.info(
-            "Synced %d models from %s (%d new jobs created)",
+            "Synced %d models, %d prompts (%d new jobs created)",
             len(model_ids),
-            config.models_path,
+            len(synced_prompt_ids),
             jobs_created,
         )
         logger.info("Dataset: %d clips, %d pending jobs", clips, pending_total)
@@ -233,6 +316,8 @@ def run_jobs(config: Config) -> None:
 
         total_processed = 0
         for index, model_name in enumerate(model_names):
+            remaining_models = set(model_names[index:])
+            current_model[0] = model_name
             model_num = index + 1
             logger.info(
                 "--- Model %d/%d: %s ---",
@@ -261,15 +346,11 @@ def run_jobs(config: Config) -> None:
             try:
                 prefetcher.ensure_pulled(model_name)
             except Exception as exc:
-                logger.error("Failed to pull model %s: %s", model_name, exc)
-                with db.session() as conn:
-                    failed = db.fail_pending_jobs_for_model(
-                        conn, model_id, f"Model pull failed: {exc}"
-                    )
-                logger.info(
-                    "Marked %d pending jobs as failed for %s",
-                    failed,
+                logger.error(
+                    "Failed to pull model %s: %s (leaving %d jobs pending for retry)",
                     model_name,
+                    exc,
+                    pending_before_pull,
                 )
                 continue
 
@@ -293,14 +374,7 @@ def run_jobs(config: Config) -> None:
                     "No runnable jobs left for %s after capability check, skipping evaluation",
                     model_name,
                 )
-                try:
-                    client.delete_model(model_name)
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to delete model %s: %s",
-                        model_name,
-                        exc,
-                    )
+                cache.mark_done(model_name)
                 continue
 
             if index + 1 < len(model_names):
@@ -317,7 +391,7 @@ def run_jobs(config: Config) -> None:
                 client,
                 model_id,
                 model_name,
-                system_prompt,
+                config,
                 pending_total=pending,
             )
             total_processed += processed
@@ -331,11 +405,7 @@ def run_jobs(config: Config) -> None:
                 processed,
                 _format_status_counts(model_counts),
             )
-
-            try:
-                client.delete_model(model_name)
-            except Exception as exc:
-                logger.warning("Failed to delete model %s: %s", model_name, exc)
+            cache.mark_done(model_name)
 
         with db.session() as conn:
             final_counts = db.job_status_counts(conn)
@@ -345,6 +415,7 @@ def run_jobs(config: Config) -> None:
             total_processed,
         )
         logger.info("Final job status: %s", _format_status_counts(final_counts))
+        cache.log_cache_summary()
     finally:
         logger.info("Shutting down runner")
         prefetcher.cancel_all()
@@ -356,28 +427,35 @@ def run_status(config: Config) -> None:
     db.initialize()
 
     with db.session() as conn:
-        model_names, _, jobs_created = sync_models_from_config(db, conn, config)
+        model_names, _, prompt_ids, jobs_created = sync_from_config(db, conn, config)
         clips = db.count_clips(conn)
         counts = db.job_status_counts(conn)
+        failure_counts = db.failure_kind_counts(conn)
         pending = counts.get("pending", 0)
         verdict_counts = db.verdict_counts(conn)
 
     print(f"Database: {config.sqlite_db}")
     print(f"Models: {len(model_names)} (from {config.models_path})")
+    print(f"Prompts: {len(prompt_ids)} (from {config.prompts_dir})")
+    print(f"Max job attempts: {config.max_job_attempts}")
     print(f"Clips: {clips}")
     if clips == 0:
         print("Jobs: none (run import first)")
         return
     print(f"Jobs to run: {pending}")
     if jobs_created:
-        print(f"New jobs created from {config.models_path}: {jobs_created}")
+        print(f"New jobs created from sync: {jobs_created}")
     if counts:
         print("Jobs:")
         for status in sorted(counts):
             print(f"  {status}: {counts[status]}")
     else:
         print("Jobs: none")
+    if failure_counts:
+        print("Failure kinds:")
+        for kind in sorted(failure_counts):
+            print(f"  {kind}: {failure_counts[kind]}")
     if verdict_counts:
-        print("Verdicts:")
+        print("Verdicts (completed jobs only):")
         for verdict in sorted(verdict_counts):
             print(f"  {verdict}: {verdict_counts[verdict]}")

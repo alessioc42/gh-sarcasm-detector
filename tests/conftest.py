@@ -21,15 +21,21 @@ def tmp_db(tmp_path: Path) -> Database:
 
 @pytest.fixture
 def config(tmp_path: Path) -> Config:
-    (tmp_path / "system_prompt.txt").write_text("You are a test prompt.")
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    (prompts_dir / "default.txt").write_text("You are a test prompt.")
     (tmp_path / "models.txt").write_text("test-model\n# comment\n")
     return Config(
         ollama_endpoint="http://localhost:11434",
         ollama_api_token=None,
         sqlite_db=tmp_path / "test.db",
-        system_prompt_path=tmp_path / "system_prompt.txt",
+        prompts_dir=prompts_dir,
         models_path=tmp_path / "models.txt",
         raw_data_dir=tmp_path / "raw_data",
+        max_job_attempts=3,
+        ollama_models_dir=tmp_path / "ollama_models",
+        min_free_disk_bytes=2_000_000_000,
+        model_pull_reserve_bytes=8_000_000_000,
     )
 
 
@@ -125,7 +131,10 @@ def seed_clip_with_job():
                 original_filename=f"{language}.txt",
             )
             model_id = db.upsert_model(conn, "test-model")
-            db.ensure_jobs_for_clip(conn, clip_id, [model_id], {(modality, language)})
+            prompt_id = db.upsert_prompt(conn, "default", "default.txt")
+            db.ensure_jobs_for_clip(
+                conn, clip_id, [model_id], [prompt_id], {(modality, language)}
+            )
         return clip_id
 
     return _seed

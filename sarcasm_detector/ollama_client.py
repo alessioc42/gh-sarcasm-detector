@@ -20,6 +20,13 @@ _ESTIMATED_RESPONSE_JSON_TOKENS = 15
 MAX_GENERATED_TOKENS = _ESTIMATED_RESPONSE_JSON_TOKENS * 40
 
 
+@dataclass(frozen=True)
+class InstalledModel:
+    name: str
+    size_bytes: int
+    modified_at: str | None
+
+
 @dataclass
 class ChatResult:
     raw_body: str
@@ -58,6 +65,38 @@ class OllamaClient:
             return True
         except (ResponseError, ConnectionError):
             return False
+
+    def list_installed_models(self) -> list[InstalledModel]:
+        response = self._client.list()
+        data = response.model_dump() if hasattr(response, "model_dump") else response
+        models = data.get("models") if isinstance(data, dict) else []
+        installed: list[InstalledModel] = []
+        for entry in models or []:
+            if isinstance(entry, dict):
+                name = str(entry.get("name") or entry.get("model") or "")
+                size = int(entry.get("size") or 0)
+                modified_at = entry.get("modified_at")
+            else:
+                name = str(getattr(entry, "name", None) or getattr(entry, "model", ""))
+                size = int(getattr(entry, "size", 0) or 0)
+                modified_at = getattr(entry, "modified_at", None)
+            if not name:
+                continue
+            modified_str = str(modified_at) if modified_at is not None else None
+            installed.append(
+                InstalledModel(
+                    name=name,
+                    size_bytes=size,
+                    modified_at=modified_str,
+                )
+            )
+        return installed
+
+    def installed_model_size(self, model: str) -> int | None:
+        for installed in self.list_installed_models():
+            if installed.name == model:
+                return installed.size_bytes
+        return None
 
     def pull_model(self, model: str) -> None:
         logger.info("Pulling model %s...", model)

@@ -232,6 +232,7 @@ def import_archive(
     conn,
     archive_path: Path,
     model_ids: list[int],
+    prompt_ids: list[int],
 ) -> tuple[int, int]:
     archive_name = archive_path.name
     imported = 0
@@ -280,7 +281,9 @@ def import_archive(
                 )
 
             pairs = available_job_pairs(pending.assets)
-            jobs_created += db.ensure_jobs_for_clip(conn, clip_id, model_ids, pairs)
+            jobs_created += db.ensure_jobs_for_clip(
+                conn, clip_id, model_ids, prompt_ids, pairs
+            )
             imported += 1
             logger.info("Imported clip %s (%d assets)", source_key, len(pending.assets))
 
@@ -294,18 +297,24 @@ def sync_models(db: Database, conn, model_names: list[str]) -> list[int]:
     return ids
 
 
-def sync_models_from_config(
-    db: Database, conn, config: Config
-) -> tuple[list[str], list[int], int]:
-    model_names = config.load_models()
-    if not model_names:
-        return model_names, [], 0
-    model_ids = sync_models(db, conn, model_names)
-    created = ensure_jobs_for_new_models(db, conn, model_ids)
-    return model_names, model_ids, created
+def sync_prompts(db: Database, conn, config: Config) -> list[int]:
+    prompts = config.load_prompts()
+    if not prompts:
+        raise ValueError(
+            f"No .txt prompt files found in {config.prompts_dir}"
+        )
+    ids: list[int] = []
+    for slug, path in prompts:
+        ids.append(db.upsert_prompt(conn, slug, path.name))
+    return ids
 
 
-def ensure_jobs_for_new_models(db: Database, conn, model_ids: list[int]) -> int:
+def ensure_jobs_for_clips(
+    db: Database,
+    conn,
+    model_ids: list[int],
+    prompt_ids: list[int],
+) -> int:
     created = 0
     rows = conn.execute("SELECT id FROM clips").fetchall()
     for row in rows:
@@ -320,8 +329,31 @@ def ensure_jobs_for_new_models(db: Database, conn, model_ids: list[int]) -> int:
             pairs.add(("audio", "en"))
         if "audio_de" in assets:
             pairs.add(("audio", "de"))
-        created += db.ensure_jobs_for_clip(conn, clip_id, model_ids, pairs)
+        created += db.ensure_jobs_for_clip(
+            conn, clip_id, model_ids, prompt_ids, pairs
+        )
     return created
+
+
+def sync_from_config(
+    db: Database, conn, config: Config
+) -> tuple[list[str], list[int], list[int], int]:
+    model_names = config.load_models()
+    prompt_ids = sync_prompts(db, conn, config)
+
+    if not model_names:
+        return model_names, [], prompt_ids, 0
+
+    model_ids = sync_models(db, conn, model_names)
+    created = ensure_jobs_for_clips(db, conn, model_ids, prompt_ids)
+    return model_names, model_ids, prompt_ids, created
+
+
+def sync_models_from_config(
+    db: Database, conn, config: Config
+) -> tuple[list[str], list[int], int]:
+    model_names, model_ids, _, created = sync_from_config(db, conn, config)
+    return model_names, model_ids, created
 
 
 def run_sync_models(config: Config) -> None:
@@ -330,16 +362,18 @@ def run_sync_models(config: Config) -> None:
     db.initialize()
 
     with db.session() as conn:
-        model_names, _, created = sync_models_from_config(db, conn, config)
+        model_names, _, prompt_ids, created = sync_from_config(db, conn, config)
 
     if not model_names:
         logger.error("No models listed in %s", config.models_path)
         return
 
     logger.info(
-        "Synced %d models from %s, created %d new jobs (db: %s)",
+        "Synced %d models from %s, %d prompts from %s, created %d new jobs (db: %s)",
         len(model_names),
         config.models_path,
+        len(prompt_ids),
+        config.prompts_dir,
         created,
         config.sqlite_db,
     )
@@ -363,12 +397,14 @@ def run_import(config: Config) -> None:
     total_jobs = 0
 
     with db.session() as conn:
-        _, model_ids, new_model_jobs = sync_models_from_config(db, conn, config)
+        _, model_ids, prompt_ids, new_model_jobs = sync_from_config(db, conn, config)
         total_jobs += new_model_jobs
 
         for archive in archives:
             logger.info("Importing %s", archive.name)
-            imported, jobs = import_archive(db, conn, archive, model_ids)
+            imported, jobs = import_archive(
+                db, conn, archive, model_ids, prompt_ids
+            )
             total_imported += imported
             total_jobs += jobs
 

@@ -1,140 +1,45 @@
 from __future__ import annotations
 
-import sqlite3
-import tempfile
 from pathlib import Path
-from unittest import mock
 
 import pytest
 
-from sarcasm_detector.db import Database, JobRecord, SCHEMA_VERSION
+from sarcasm_detector.db import (
+    FAILURE_KIND_INFERENCE_ERROR,
+    FAILURE_KIND_MISSING_ASSET,
+    FAILURE_KIND_UNSUPPORTED_MODALITY,
+    Database,
+    JobRecord,
+)
 
 
 class TestDatabase:
     def test_initialize_creates_schema(self, tmp_db: Database) -> None:
         with tmp_db.session() as conn:
-            version = conn.execute("SELECT version FROM schema_version").fetchone()
-            assert version is not None
-            assert int(version["version"]) == SCHEMA_VERSION
-
-    def test_migration_adds_blob_encoding(self, tmp_path: Path) -> None:
-        db_path = tmp_path / "legacy.db"
-        conn = sqlite3.connect(db_path)
-        conn.executescript(
-            """
-            CREATE TABLE schema_version (version INTEGER NOT NULL);
-            INSERT INTO schema_version VALUES (1);
-            CREATE TABLE series (id INTEGER PRIMARY KEY, name TEXT UNIQUE);
-            CREATE TABLE clips (
-                id INTEGER PRIMARY KEY,
-                series_id INTEGER,
-                source_key TEXT UNIQUE,
-                source_archive TEXT,
-                source_path TEXT,
-                episode TEXT,
-                time_start TEXT,
-                time_end TEXT,
-                ground_truth_sarcasm INTEGER,
-                created_at TEXT DEFAULT (datetime('now'))
-            );
-            CREATE TABLE clip_assets (
-                id INTEGER PRIMARY KEY,
-                clip_id INTEGER,
-                asset_type TEXT,
-                mime_type TEXT,
-                content_text TEXT,
-                content_blob BLOB,
-                original_filename TEXT,
-                UNIQUE (clip_id, asset_type)
-            );
-            CREATE TABLE models (
-                id INTEGER PRIMARY KEY,
-                name TEXT UNIQUE,
-                supports_audio INTEGER,
-                capabilities_json TEXT,
-                last_checked_at TEXT
-            );
-            CREATE TABLE jobs (
-                id INTEGER PRIMARY KEY,
-                clip_id INTEGER,
-                model_id INTEGER,
-                modality TEXT,
-                language TEXT,
-                status TEXT DEFAULT 'pending',
-                attempt_count INTEGER DEFAULT 0,
-                last_error TEXT,
-                created_at TEXT DEFAULT (datetime('now')),
-                started_at TEXT,
-                finished_at TEXT,
-                UNIQUE (clip_id, model_id, modality, language)
-            );
-            CREATE TABLE job_outputs (
-                id INTEGER PRIMARY KEY,
-                job_id INTEGER,
-                raw_response_body TEXT,
-                request_payload_json TEXT,
-                http_status INTEGER,
-                duration_ms INTEGER,
-                error_message TEXT,
-                created_at TEXT DEFAULT (datetime('now'))
-            );
-            """
-        )
-        conn.commit()
-        conn.close()
-
-        db = Database(db_path)
-        db.initialize()
-        with db.session() as conn:
-            cols = {
-                row[1]
-                for row in conn.execute("PRAGMA table_info(clip_assets)").fetchall()
-            }
-            assert "blob_encoding" in cols
-            assert int(conn.execute("SELECT version FROM schema_version").fetchone()[0]) == SCHEMA_VERSION
-
-    def test_migration_adds_job_verdicts(self, tmp_path: Path) -> None:
-        db_path = tmp_path / "v2.db"
-        conn = sqlite3.connect(db_path)
-        conn.executescript(
-            """
-            CREATE TABLE schema_version (version INTEGER NOT NULL);
-            INSERT INTO schema_version VALUES (2);
-            CREATE TABLE jobs (
-                id INTEGER PRIMARY KEY,
-                clip_id INTEGER,
-                model_id INTEGER,
-                modality TEXT,
-                language TEXT,
-                status TEXT DEFAULT 'pending',
-                attempt_count INTEGER DEFAULT 0,
-                last_error TEXT,
-                created_at TEXT DEFAULT (datetime('now')),
-                started_at TEXT,
-                finished_at TEXT
-            );
-            """
-        )
-        conn.commit()
-        conn.close()
-
-        db = Database(db_path)
-        db.initialize()
-        with db.session() as conn:
             tables = {
                 row[0]
                 for row in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 ).fetchall()
             }
+            assert "prompts" in tables
+            assert "jobs" in tables
             assert "job_verdicts" in tables
-            assert int(conn.execute("SELECT version FROM schema_version").fetchone()[0]) == SCHEMA_VERSION
+            assert "schema_version" not in tables
 
     def test_get_or_create_series(self, tmp_db: Database) -> None:
         with tmp_db.session() as conn:
             a = tmp_db.get_or_create_series(conn, "Show")
             b = tmp_db.get_or_create_series(conn, "Show")
         assert a == b
+
+    def test_upsert_prompt(self, tmp_db: Database) -> None:
+        with tmp_db.session() as conn:
+            pid = tmp_db.upsert_prompt(conn, "default", "default.txt")
+            pid2 = tmp_db.upsert_prompt(conn, "default", "default.txt")
+            prompts = tmp_db.list_prompts(conn)
+        assert pid == pid2
+        assert prompts == [(pid, "default", "default.txt")]
 
     def test_clip_exists_and_insert(self, tmp_db: Database) -> None:
         with tmp_db.session() as conn:
@@ -219,25 +124,91 @@ class TestDatabase:
                 ground_truth_sarcasm=True,
             )
             model_id = tmp_db.upsert_model(conn, "m1")
+            prompt_id = tmp_db.upsert_prompt(conn, "default", "default.txt")
             first = tmp_db.ensure_jobs_for_clip(
-                conn, clip_id, [model_id], {("text", "en"), ("audio", "de")}
+                conn,
+                clip_id,
+                [model_id],
+                [prompt_id],
+                {("text", "en"), ("audio", "de")},
             )
             second = tmp_db.ensure_jobs_for_clip(
-                conn, clip_id, [model_id], {("text", "en"), ("audio", "de")}
+                conn,
+                clip_id,
+                [model_id],
+                [prompt_id],
+                {("text", "en"), ("audio", "de")},
             )
         assert first == 2
         assert second == 0
+
+    def test_ensure_jobs_per_prompt(self, tmp_db: Database) -> None:
+        with tmp_db.session() as conn:
+            series_id = tmp_db.get_or_create_series(conn, "Show")
+            clip_id = tmp_db.insert_clip(
+                conn,
+                series_id=series_id,
+                source_key="k",
+                source_archive="a.zip",
+                source_path="01",
+                episode=None,
+                time_start=None,
+                time_end=None,
+                ground_truth_sarcasm=True,
+            )
+            model_id = tmp_db.upsert_model(conn, "m1")
+            prompt_a = tmp_db.upsert_prompt(conn, "a", "a.txt")
+            prompt_b = tmp_db.upsert_prompt(conn, "b", "b.txt")
+            created = tmp_db.ensure_jobs_for_clip(
+                conn,
+                clip_id,
+                [model_id],
+                [prompt_a, prompt_b],
+                {("text", "en")},
+            )
+        assert created == 2
 
     def test_claim_and_finish_job(self, tmp_db: Database, seed_clip_with_job) -> None:
         seed_clip_with_job(tmp_db)
         with tmp_db.session() as conn:
             job = tmp_db.claim_next_job(conn)
             assert isinstance(job, JobRecord)
+            assert job.prompt_slug == "default"
             tmp_db.finish_job(conn, job.id, "completed")
             status = conn.execute(
                 "SELECT status FROM jobs WHERE id = ?", (job.id,)
             ).fetchone()
             assert status["status"] == "completed"
+
+    def test_finish_job_with_failure_kind(self, tmp_db: Database, seed_clip_with_job) -> None:
+        seed_clip_with_job(tmp_db)
+        with tmp_db.session() as conn:
+            job_id = conn.execute("SELECT id FROM jobs").fetchone()["id"]
+            tmp_db.finish_job(
+                conn,
+                job_id,
+                "failed",
+                last_error="HTTP 500",
+                failure_kind=FAILURE_KIND_INFERENCE_ERROR,
+            )
+            row = conn.execute(
+                "SELECT failure_kind FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        assert row["failure_kind"] == FAILURE_KIND_INFERENCE_ERROR
+
+    def test_requeue_job(self, tmp_db: Database, seed_clip_with_job) -> None:
+        seed_clip_with_job(tmp_db)
+        with tmp_db.session() as conn:
+            job = tmp_db.claim_next_job(conn)
+            assert job is not None
+            tmp_db.requeue_job(conn, job.id, last_error="HTTP 500")
+            row = conn.execute(
+                "SELECT status, attempt_count, last_error FROM jobs WHERE id = ?",
+                (job.id,),
+            ).fetchone()
+        assert row["status"] == "pending"
+        assert row["attempt_count"] == 1
+        assert row["last_error"] == "HTTP 500"
 
     def test_reset_running_jobs(self, tmp_db: Database, seed_clip_with_job) -> None:
         seed_clip_with_job(tmp_db)
@@ -266,15 +237,21 @@ class TestDatabase:
                 ground_truth_sarcasm=True,
             )
             model_id = tmp_db.upsert_model(conn, "m1")
+            prompt_id = tmp_db.upsert_prompt(conn, "default", "default.txt")
             tmp_db.ensure_jobs_for_clip(
-                conn, clip_id, [model_id], {("text", "en"), ("audio", "en")}
+                conn,
+                clip_id,
+                [model_id],
+                [prompt_id],
+                {("text", "en"), ("audio", "en")},
             )
             skipped = tmp_db.skip_audio_jobs_for_model(conn, model_id, "no audio")
             row = conn.execute(
-                "SELECT status FROM jobs WHERE modality = 'audio'"
+                "SELECT status, failure_kind FROM jobs WHERE modality = 'audio'"
             ).fetchone()
         assert skipped == 1
         assert row["status"] == "skipped"
+        assert row["failure_kind"] == FAILURE_KIND_UNSUPPORTED_MODALITY
 
     def test_insert_job_output_and_counts(self, tmp_db: Database, seed_clip_with_job) -> None:
         seed_clip_with_job(tmp_db)
@@ -325,8 +302,13 @@ class TestDatabase:
             )
             model_a = tmp_db.upsert_model(conn, "model-a")
             model_b = tmp_db.upsert_model(conn, "model-b")
-            tmp_db.ensure_jobs_for_clip(conn, clip_id, [model_a], {("text", "en")})
-            tmp_db.ensure_jobs_for_clip(conn, clip_id, [model_b], {("text", "en")})
+            prompt_id = tmp_db.upsert_prompt(conn, "default", "default.txt")
+            tmp_db.ensure_jobs_for_clip(
+                conn, clip_id, [model_a], [prompt_id], {("text", "en")}
+            )
+            tmp_db.ensure_jobs_for_clip(
+                conn, clip_id, [model_b], [prompt_id], {("text", "en")}
+            )
 
         with tmp_db.session() as conn:
             job_a = tmp_db.claim_next_job_for_model(conn, model_a)
@@ -337,36 +319,25 @@ class TestDatabase:
         assert job_a.model_name == "model-a"
         assert job_b.model_name == "model-b"
 
-    def test_fail_pending_jobs_for_model(self, tmp_db: Database) -> None:
-        with tmp_db.session() as conn:
-            series_id = tmp_db.get_or_create_series(conn, "Show")
-            clip_id = tmp_db.insert_clip(
-                conn,
-                series_id=series_id,
-                source_key="k",
-                source_archive="a.zip",
-                source_path="01",
-                episode=None,
-                time_start=None,
-                time_end=None,
-                ground_truth_sarcasm=True,
-            )
-            model_id = tmp_db.upsert_model(conn, "m")
-            tmp_db.ensure_jobs_for_clip(conn, clip_id, [model_id], {("text", "en")})
-            failed = tmp_db.fail_pending_jobs_for_model(conn, model_id, "pull failed")
-            assert failed == 1
-
     def test_count_pending_jobs_for_model(self, tmp_db: Database, seed_clip_with_job) -> None:
         seed_clip_with_job(tmp_db)
         with tmp_db.session() as conn:
             model_id = tmp_db.upsert_model(conn, "test-model")
             assert tmp_db.count_pending_jobs_for_model(conn, model_id) == 1
 
-    def test_migrate_noop_when_current(self, tmp_db: Database) -> None:
-        tmp_db.initialize()
+    def test_failure_kind_counts(self, tmp_db: Database, seed_clip_with_job) -> None:
+        seed_clip_with_job(tmp_db)
         with tmp_db.session() as conn:
-            version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-        assert version == SCHEMA_VERSION
+            job_id = conn.execute("SELECT id FROM jobs").fetchone()["id"]
+            tmp_db.finish_job(
+                conn,
+                job_id,
+                "failed",
+                last_error="missing",
+                failure_kind=FAILURE_KIND_MISSING_ASSET,
+            )
+            counts = tmp_db.failure_kind_counts(conn)
+        assert counts[FAILURE_KIND_MISSING_ASSET] == 1
 
     def test_upsert_job_verdict(self, tmp_db: Database, seed_clip_with_job) -> None:
         seed_clip_with_job(tmp_db)
@@ -397,6 +368,24 @@ class TestDatabase:
         assert row["sarcastic"] == 0
         assert row["confidence"] is None
         assert counts["NOT_SARCASTIC"] == 1
+
+    def test_delete_job_verdict(self, tmp_db: Database, seed_clip_with_job) -> None:
+        seed_clip_with_job(tmp_db)
+        with tmp_db.session() as conn:
+            job_id = conn.execute("SELECT id FROM jobs").fetchone()["id"]
+            tmp_db.upsert_job_verdict(
+                conn,
+                job_id=job_id,
+                verdict="SARCASTIC",
+                sarcastic=True,
+                confidence=7,
+                parse_error=None,
+            )
+            tmp_db.delete_job_verdict(conn, job_id)
+            count = conn.execute(
+                "SELECT COUNT(*) FROM job_verdicts WHERE job_id = ?", (job_id,)
+            ).fetchone()[0]
+        assert count == 0
 
     def test_get_latest_job_output(self, tmp_db: Database, seed_clip_with_job) -> None:
         seed_clip_with_job(tmp_db)

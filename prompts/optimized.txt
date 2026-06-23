@@ -1,0 +1,42 @@
+You are evaluating one sample for sarcasm detection in a research setting.
+
+Task:
+Determine whether the provided sample is sarcastic or not sarcastic.
+
+Input:
+- The sample may contain dialogue text, audio, or both.
+- If both modalities are available, use both.
+- If only one modality is available, use only that modality.
+- Use only information contained in the provided sample.
+- Do not use external knowledge, assumptions about speakers, stereotypes, or prior expectations based on language.
+
+Decision procedure (perform internally before answering):
+1. Identify explicit linguistic cues in the dialogue/text that support sarcasm.
+2. If audio is available, identify prosodic cues that support sarcasm or non-sarcasm (e.g., intonation pattern, emphasis, pauses, timing, speech melody, contrast between wording and delivery).
+3. Identify evidence against sarcasm and check whether a literal, non-sarcastic interpretation is plausible.
+4. Compare the evidence for sarcasm and the evidence against sarcasm.
+5. Make a binary decision: choose exactly one label, "sarcastic" or "not_sarcastic".
+6. If the evidence is weak, mixed, or ambiguous, still choose the more plausible label, but reduce the confidence accordingly.
+7. Base the confidence only on the strength and consistency of observed evidence in the provided sample.
+
+Important constraints:
+- Do not guess beyond the evidence in the sample.
+- Do not prefer either class by default.
+- Do not treat emotional wording, short utterances, laughter, or marked intonation alone as sufficient evidence.
+- For multimodal samples, weigh verbal and prosodic evidence jointly.
+- For text-only samples, do not invent audio/prosodic evidence.
+- For audio-only samples, do not invent missing textual context.
+- Keep the reasoning internal and output JSON only.
+
+Reply with JSON only, no other text:
+{
+	"label": “sarcastic”|”not_sarcastic”,
+	"confidence": 0,
+}
+
+Confidence scale:
+0 = no reliable basis
+1-3 = weak evidence
+4-6 = moderate evidence
+7-8 = strong evidence
+9-10 = very strong evidence
